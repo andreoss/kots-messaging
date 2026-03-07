@@ -1,20 +1,29 @@
 package kots.mq.mem
 
-import cats.effect.kernel.{Concurrent, Ref, Resource}
+import cats.effect.kernel.{Ref, Resource, Temporal}
 import cats.syntax.all._
 import kots.mq._
+
+import scala.concurrent.duration.FiniteDuration
 
 /** In-memory broker over a single reference; the contract's baseline. */
 object MemBroker {
 
-  def create[F[_], A](implicit F: Concurrent[F]): F[Broker[F, A]] =
-    F.ref(State.empty[A]).map(new MemBroker[F, A](_))
+  def create[F[_], A](entropy: Entropy[F])(implicit F: Temporal[F]): F[Broker[F, A]] =
+    F.ref(State.empty[A]).map(new MemBroker[F, A](_, entropy))
 
-  private[mem] final case class Pending[A](envelope: Envelope[A])
+  private[mem] final case class Pending[A](envelope: Envelope[A], visibleAt: FiniteDuration)
+
+  private[mem] final case class Leased[A](
+    destination: Destination,
+    envelope: Envelope[A],
+    expiresAt: FiniteDuration,
+    settings: ConsumerSettings,
+  )
 
   private[mem] final case class State[A](
     ready: Map[Destination, Vector[Pending[A]]],
-    inflight: Map[MessageId, (Destination, Pending[A])],
+    leased: Map[MessageId, Leased[A]],
     published: Long,
   )
 
@@ -23,65 +32,134 @@ object MemBroker {
   }
 }
 
-private final class MemBroker[F[_], A](state: Ref[F, MemBroker.State[A]])(implicit
-  F: Concurrent[F]
-) extends Broker[F, A] {
+private final class MemBroker[F[_], A](
+  state: Ref[F, MemBroker.State[A]],
+  entropy: Entropy[F],
+)(implicit F: Temporal[F])
+  extends Broker[F, A] {
 
   import MemBroker._
 
   def producer(destination: Destination): Resource[F, Producer[F, A]] =
     Resource.pure(new Producer[F, A] {
       def send(message: Message[A]): F[MessageId] =
-        state.modify { current =>
-          val id = MessageId((current.published + 1).toString)
-          val pending = Pending(Envelope(id, message, 1))
-          val queue = current.ready.getOrElse(destination, Vector.empty) :+ pending
-          val next = current.copy(
-            ready = current.ready.updated(destination, queue),
-            published = current.published + 1,
-          )
-          (next, id)
+        F.monotonic.flatMap { now =>
+          state.modify { current =>
+            val id = MessageId((current.published + 1).toString)
+            val pending = Pending(Envelope(id, message, 1), now)
+            (
+              push(current, destination, pending).copy(published = current.published + 1),
+              id,
+            )
+          }
         }
     })
 
-  def consumer(destination: Destination): Resource[F, Consumer[F, A]] =
+  def consumer(
+    destination: Destination,
+    settings: ConsumerSettings,
+  ): Resource[F, Consumer[F, A]] =
     Resource.pure(new Consumer[F, A] {
       def receive: F[Option[Delivery[F, A]]] =
-        state
-          .modify { current =>
-            current.ready.getOrElse(destination, Vector.empty) match {
-              case head +: rest =>
-                val next = current.copy(
-                  ready = current.ready.updated(destination, rest),
-                  inflight = current.inflight.updated(head.envelope.id, (destination, head)),
-                )
-                (next, Some(head))
-              case _ => (current, None)
-            }
-          }
-          .map(_.map(pending => delivery(destination, pending)))
+        for {
+          now <- F.monotonic
+          sample <- entropy.nextDouble
+          taken <- state.modify(take(_, destination, settings, now, sample))
+        } yield taken.map(delivery)
     })
 
-  private def delivery(destination: Destination, pending: Pending[A]): Delivery[F, A] =
+  private def delivery(taken: Envelope[A]): Delivery[F, A] =
     new Delivery[F, A] {
-      val envelope: Envelope[A] = pending.envelope
+      val envelope: Envelope[A] = taken
 
-      val ack: F[Unit] =
-        state.update(current => current.copy(inflight = current.inflight - envelope.id))
+      val ack: F[Unit] = state.update(current => current.copy(leased = current.leased - taken.id))
 
       val reject: F[Unit] =
-        state.update { current =>
-          current.inflight.get(envelope.id) match {
-            case None => current
-            case Some(_) =>
-              val redelivered =
-                Pending(envelope.copy(attempt = envelope.attempt + 1))
-              val queue = redelivered +: current.ready.getOrElse(destination, Vector.empty)
-              current.copy(
-                ready = current.ready.updated(destination, queue),
-                inflight = current.inflight - envelope.id,
+        for {
+          now <- F.monotonic
+          sample <- entropy.nextDouble
+          _ <- state.update { current =>
+            current.leased.get(taken.id) match {
+              case None => current
+              case Some(held) =>
+                requeue(
+                  current.copy(leased = current.leased - taken.id),
+                  held.destination,
+                  held.envelope,
+                  held.settings,
+                  now,
+                  sample,
+                )
+            }
+          }
+        } yield ()
+
+      def extend(by: FiniteDuration): F[Unit] =
+        F.monotonic.flatMap { now =>
+          state.update { current =>
+            current.leased
+              .get(taken.id)
+              .fold(current)(held =>
+                current.copy(
+                  leased = current.leased.updated(taken.id, held.copy(expiresAt = now + by))
+                )
               )
           }
         }
     }
+
+  private def take(
+    current: State[A],
+    destination: Destination,
+    settings: ConsumerSettings,
+    now: FiniteDuration,
+    sample: Double,
+  ): (State[A], Option[Envelope[A]]) = {
+    val swept = sweep(current, now, sample)
+    val queue = swept.ready.getOrElse(destination, Vector.empty)
+    queue.indexWhere(_.visibleAt <= now) match {
+      case -1 => (swept, None)
+      case index =>
+        val pending = queue(index)
+        val held = Leased(destination, pending.envelope, now + settings.lease, settings)
+        (
+          swept.copy(
+            ready = swept.ready.updated(destination, queue.patch(index, Vector.empty, 1)),
+            leased = swept.leased.updated(pending.envelope.id, held),
+          ),
+          Some(pending.envelope),
+        )
+    }
+  }
+
+  private def sweep(current: State[A], now: FiniteDuration, sample: Double): State[A] = {
+    val expired = current.leased.values.filter(_.expiresAt <= now).toList
+    expired.foldLeft(current.copy(leased = current.leased -- expired.map(_.envelope.id))) {
+      (acc, held) =>
+        requeue(acc, held.destination, held.envelope, held.settings, now, sample)
+    }
+  }
+
+  private def requeue(
+    current: State[A],
+    destination: Destination,
+    envelope: Envelope[A],
+    settings: ConsumerSettings,
+    now: FiniteDuration,
+    sample: Double,
+  ): State[A] =
+    if (envelope.attempt >= settings.maxAttempts)
+      settings.deadLetter.fold(current)(parked =>
+        push(current, parked, Pending(envelope, now))
+      )
+    else {
+      val next = envelope.copy(attempt = envelope.attempt + 1)
+      push(current, destination, Pending(next, now + settings.backoff.delay(envelope.attempt, sample)))
+    }
+
+  private def push(current: State[A], destination: Destination, pending: Pending[A]): State[A] =
+    current.copy(
+      ready = current.ready
+        .updated(destination, current.ready.getOrElse(destination, Vector.empty) :+ pending)
+    )
 }

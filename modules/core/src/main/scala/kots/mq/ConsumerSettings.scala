@@ -1,0 +1,22 @@
+package kots.mq
+
+import scala.concurrent.duration._
+
+/** How long a consumer holds a message and what it does when it fails. */
+final case class ConsumerSettings(
+  lease: FiniteDuration,
+  maxAttempts: Int,
+  backoff: Backoff,
+  deadLetter: Option[Destination],
+) {
+  def withLease(duration: FiniteDuration): ConsumerSettings = copy(lease = duration)
+  def withMaxAttempts(attempts: Int): ConsumerSettings = copy(maxAttempts = attempts max 1)
+  def withBackoff(policy: Backoff): ConsumerSettings = copy(backoff = policy)
+  def withDeadLetter(destination: Destination): ConsumerSettings =
+    copy(deadLetter = Some(destination))
+}
+
+object ConsumerSettings {
+
+  val default: ConsumerSettings = ConsumerSettings(30.seconds, 5, Backoff.default, None)
+}

@@ -12,6 +12,9 @@ abstract class QueueContract extends CatsEffectSuite {
 
   def broker: Resource[IO, Broker[IO, String]]
 
+  private val settings: ConsumerSettings =
+    ConsumerSettings.default.withBackoff(Backoff.none)
+
   private val counter = new AtomicInteger(0)
 
   private def fresh: Destination =
@@ -20,7 +23,7 @@ abstract class QueueContract extends CatsEffectSuite {
   private def endpoints(
     destination: Destination
   )(implicit b: Broker[IO, String]): Resource[IO, (Producer[IO, String], Consumer[IO, String])] =
-    (b.producer(destination), b.consumer(destination)).tupled
+    (b.producer(destination), b.consumer(destination, settings)).tupled
 
   private def withEndpoints[A](
     f: (Producer[IO, String], Consumer[IO, String]) => IO[A]
