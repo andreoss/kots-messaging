@@ -1,0 +1,48 @@
+# kots-mq
+
+Provider-agnostic message-queue library on Cats and Cats Effect, cross-built
+for Scala 2.13 and 3. One algebra in `core`; every broker is an adapter over
+it. The core depends on Cats and Cats Effect only.
+
+## Algebra
+
+`Producer[F, A]` publishes; `Consumer[F, A]` hands out `Delivery[F, A]`
+values that carry `ack`, `reject` and `extend`. Settling is the caller's:
+nothing is acknowledged because an effect completed.
+
+```scala
+import cats.effect.IO
+import kots.mq._
+import kots.mq.mem.MemBroker
+
+val destination = Destination("orders")
+
+for {
+  broker <- MemBroker.create[IO, String](Entropy.system[IO])
+  _ <- (broker.producer(destination), broker.consumer(destination, ConsumerSettings.default))
+         .tupled
+         .use { case (producer, consumer) =>
+           producer.send(Message.of("one")) *>
+             consumer.receive.flatMap(_.traverse_(_.ack))
+         }
+} yield ()
+```
+
+`ConsumerSettings` carries the lease, the attempt budget, the prefetch bound,
+the `Backoff` policy and an optional dead-letter destination. `Metered` wraps
+a producer or consumer with the metrics port; `Transcode` carries the algebra
+from wire bytes to a typed payload through a `Codec`.
+
+## Build and test
+
+    sbt -batch +test
+
+The unit tier needs no services.
+
+## Test tiers
+
+Adapters over live brokers run against the compose stack:
+
+    docker compose up -d --wait
+    sbt -batch +test
+    docker compose down

@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [core, mem]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: coursier/cache-action@v6
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: sbt
+      - uses: sbt/setup-sbt@v1
+      - name: Tests (Scala 2.13 and 3)
+        run: sbt -batch "+${{ matrix.module }}/test"
+
+  coverage:
+    name: coverage (Scala 2.13)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: coursier/cache-action@v6
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: sbt
+      - uses: sbt/setup-sbt@v1
+      - name: Coverage gate
+        run: sbt -batch coverage "++2.13.18" core/test mem/test coverageReport coverageAggregate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scoverage-2.13
+          path: |
+            target/scala-2.13/scoverage-report/**
+            modules/*/target/scala-2.13/scoverage-report/**
+          if-no-files-found: ignore

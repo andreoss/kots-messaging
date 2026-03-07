@@ -27,9 +27,16 @@ abstract class QueueContract extends CatsEffectSuite {
 
   private def withEndpoints[A](
     f: (Producer[IO, String], Consumer[IO, String]) => IO[A]
+  ): IO[A] = withSettings(settings)(f)
+
+  private def withSettings[A](chosen: ConsumerSettings)(
+    f: (Producer[IO, String], Consumer[IO, String]) => IO[A]
   ): IO[A] =
     broker.use { implicit b =>
-      endpoints(fresh).use { case (producer, consumer) => f(producer, consumer) }
+      val destination = fresh
+      (b.producer(destination), b.consumer(destination, chosen)).tupled.use { case (producer, consumer) =>
+        f(producer, consumer)
+      }
     }
 
   test("a published message is received with payload, headers and key") {
@@ -101,6 +108,31 @@ abstract class QueueContract extends CatsEffectSuite {
         assertNotEquals(firstId, secondId)
         assertEquals(first.map(_.envelope.id), Some(firstId))
         assertEquals(second.map(_.envelope.id), Some(secondId))
+      }
+    }
+  }
+
+  test("a batch receive returns no more than the maximum asked for") {
+    withEndpoints { (producer, consumer) =>
+      for {
+        _ <- List("one", "two", "three").traverse_(body => producer.send(Message.of(body)))
+        batch <- consumer.receiveBatch(2)
+      } yield assertEquals(batch.map(_.envelope.message.payload), List("one", "two"))
+    }
+  }
+
+  test("a consumer holding its prefetch receives nothing more") {
+    withSettings(settings.withPrefetch(2)) { (producer, consumer) =>
+      for {
+        _ <- List("one", "two", "three").traverse_(body => producer.send(Message.of(body)))
+        held <- consumer.receiveBatch(10)
+        blocked <- consumer.receive
+        _ <- held.headOption.traverse_(_.ack)
+        freed <- consumer.receive
+      } yield {
+        assertEquals(held.size, 2)
+        assertEquals(blocked.map(_.envelope.message.payload), None)
+        assertEquals(freed.map(_.envelope.message.payload), Some("three"))
       }
     }
   }

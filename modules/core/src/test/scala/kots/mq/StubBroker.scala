@@ -1,0 +1,57 @@
+package kots.mq
+
+import cats.effect.kernel.{Concurrent, Ref, Resource}
+import cats.syntax.all._
+
+import scala.concurrent.duration.FiniteDuration
+
+/** Smallest broker the core can test its own wrappers against. */
+object StubBroker {
+
+  def create[F[_], A](implicit F: Concurrent[F]): F[Broker[F, A]] =
+    F.ref((Vector.empty[Envelope[A]], 0L)).map(state =>
+      new Broker[F, A] {
+
+        def producer(destination: Destination): Resource[F, Producer[F, A]] =
+          Resource.pure(new Producer[F, A] {
+            def send(message: Message[A]): F[MessageId] =
+              state.modify { case (queue, published) =>
+                val id = MessageId((published + 1).toString)
+                ((queue :+ Envelope(id, message, 1), published + 1), id)
+              }
+
+            def sendAfter(message: Message[A], delay: FiniteDuration): F[MessageId] =
+              send(message)
+          })
+
+        def consumer(
+          destination: Destination,
+          settings: ConsumerSettings,
+        ): Resource[F, Consumer[F, A]] =
+          Resource.pure(new Consumer[F, A] {
+
+            def receive: F[Option[Delivery[F, A]]] =
+              receiveBatch(1).map(_.headOption)
+
+            def receiveBatch(max: Int): F[List[Delivery[F, A]]] =
+              state
+                .modify { case (queue, published) =>
+                  val taken = queue.take(max max 0)
+                  ((queue.drop(taken.size), published), taken.toList)
+                }
+                .map(_.map(delivery))
+          })
+
+        private def delivery(taken: Envelope[A]): Delivery[F, A] =
+          new Delivery[F, A] {
+            val envelope: Envelope[A] = taken
+            val ack: F[Unit] = F.unit
+            val reject: F[Unit] =
+              state.update { case (queue, published) =>
+                (queue :+ taken.copy(attempt = taken.attempt + 1), published)
+              }
+            def extend(by: FiniteDuration): F[Unit] = F.unit
+          }
+      }
+    )
+}

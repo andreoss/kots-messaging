@@ -11,7 +11,11 @@ final case class Message[A](
   payload: A,
   headers: Map[String, String],
   key: Option[MessageKey],
-)
+) {
+
+  /** Same headers and key, another payload. */
+  def as[B](payload: B): Message[B] = Message(payload, headers, key)
+}
 
 object Message {
 
