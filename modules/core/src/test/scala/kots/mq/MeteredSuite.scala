@@ -15,7 +15,7 @@ final class MeteredSuite extends CatsEffectSuite {
   ): IO[Unit] =
     for {
       probe <- MetricsProbe.create
-      broker <- StubBroker.create[IO, String]
+      broker <- StubBroker.create[IO, String](Capabilities.none)
       _ <- (
         broker.producer(destination),
         broker.consumer(destination, ConsumerSettings.default.withBackoff(Backoff.none)),

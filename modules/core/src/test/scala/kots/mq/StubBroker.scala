@@ -8,9 +8,11 @@ import scala.concurrent.duration.FiniteDuration
 /** Smallest broker the core can test its own wrappers against. */
 object StubBroker {
 
-  def create[F[_], A](implicit F: Concurrent[F]): F[Broker[F, A]] =
+  def create[F[_], A](declared: Capabilities)(implicit F: Concurrent[F]): F[Broker[F, A]] =
     F.ref((Vector.empty[Envelope[A]], 0L)).map(state =>
       new Broker[F, A] {
+
+        val capabilities: Capabilities = declared
 
         def producer(destination: Destination): Resource[F, Producer[F, A]] =
           Resource.pure(new Producer[F, A] {
@@ -21,7 +23,8 @@ object StubBroker {
               }
 
             def sendAfter(message: Message[A], delay: FiniteDuration): F[MessageId] =
-              send(message)
+              if (declared.has(Capability.Delay)) send(message)
+              else F.raiseError(CapabilityUnsupported(Capability.Delay))
           })
 
         def consumer(

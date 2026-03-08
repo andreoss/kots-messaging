@@ -27,3 +27,11 @@ lazy val mem = project
   .settings(commonSettings)
   .settings(name := "kots-mq-mem")
   .dependsOn(core % "compile->compile;test->test")
+
+lazy val kafka = project
+  .in(file("modules/kafka"))
+  .settings(commonSettings)
+  .settings(name := "kots-mq-kafka")
+  .settings(libraryDependencies += kafkaClients)
+  .settings(Test / fork := true)
+  .dependsOn(core % "compile->compile;test->test")

@@ -44,6 +44,14 @@ private final class MemBroker[F[_], A](
 
   import MemBroker._
 
+  val capabilities: Capabilities =
+    Capabilities.of(
+      Capability.Delay,
+      Capability.DeadLetter,
+      Capability.Batch,
+      Capability.LeaseExtension,
+    )
+
   def producer(destination: Destination): Resource[F, Producer[F, A]] =
     Resource.pure(new Producer[F, A] {
 

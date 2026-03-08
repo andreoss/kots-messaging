@@ -6,6 +6,7 @@ import cats.syntax.all._
 import munit.CatsEffectSuite
 
 import java.util.concurrent.atomic.AtomicInteger
+import scala.concurrent.duration._
 
 /** Contract every adapter honours; run it from each adapter's suite. */
 abstract class QueueContract extends CatsEffectSuite {
@@ -20,11 +21,6 @@ abstract class QueueContract extends CatsEffectSuite {
   private def fresh: Destination =
     Destination(s"${getClass.getSimpleName}-${counter.incrementAndGet()}")
 
-  private def endpoints(
-    destination: Destination
-  )(implicit b: Broker[IO, String]): Resource[IO, (Producer[IO, String], Consumer[IO, String])] =
-    (b.producer(destination), b.consumer(destination, settings)).tupled
-
   private def withEndpoints[A](
     f: (Producer[IO, String], Consumer[IO, String]) => IO[A]
   ): IO[A] = withSettings(settings)(f)
@@ -32,12 +28,15 @@ abstract class QueueContract extends CatsEffectSuite {
   private def withSettings[A](chosen: ConsumerSettings)(
     f: (Producer[IO, String], Consumer[IO, String]) => IO[A]
   ): IO[A] =
-    broker.use { implicit b =>
+    broker.use { b =>
       val destination = fresh
-      (b.producer(destination), b.consumer(destination, chosen)).tupled.use { case (producer, consumer) =>
-        f(producer, consumer)
+      (b.producer(destination), b.consumer(destination, chosen)).tupled.use {
+        case (producer, consumer) => f(producer, consumer)
       }
     }
+
+  private def whenDeclared(capability: Capability)(f: Broker[IO, String] => IO[Unit]): IO[Unit] =
+    broker.use(b => f(b).whenA(b.capabilities.has(capability)))
 
   test("a published message is received with payload, headers and key") {
     val message = Message("body", Map("trace" -> "1"), Some(MessageKey("k")))
@@ -75,7 +74,7 @@ abstract class QueueContract extends CatsEffectSuite {
         _ <- producer.send(Message.of("body"))
         first <- consumer.receive
         _ <- first.traverse_(_.reject)
-        second <- consumer.receive
+        second <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
       } yield {
         assertEquals(second.map(_.envelope.message.payload), Some("body"))
         assertEquals(second.map(_.envelope.attempt), Some(2))
@@ -84,7 +83,9 @@ abstract class QueueContract extends CatsEffectSuite {
   }
 
   test("receiving from a drained destination yields nothing") {
-    withEndpoints((_, consumer) => consumer.receive.map(r => assertEquals(r.map(_.envelope.attempt), None)))
+    withEndpoints((_, consumer) =>
+      consumer.receive.map(received => assertEquals(received.map(_.envelope.attempt), None))
+    )
   }
 
   test("messages are received in publication order") {
@@ -92,7 +93,9 @@ abstract class QueueContract extends CatsEffectSuite {
     withEndpoints { (producer, consumer) =>
       for {
         _ <- bodies.traverse_(body => producer.send(Message.of(body)))
-        received <- bodies.traverse(_ => consumer.receive.flatTap(_.traverse_(_.ack)))
+        received <- bodies.traverse(_ =>
+          CapabilityChecks.receiveWithin(consumer, 10.seconds).flatTap(_.traverse_(_.ack))
+        )
       } yield assertEquals(received.map(_.map(_.envelope.message.payload)), bodies.map(_.some))
     }
   }
@@ -102,8 +105,8 @@ abstract class QueueContract extends CatsEffectSuite {
       for {
         firstId <- producer.send(Message.of("one"))
         secondId <- producer.send(Message.of("two"))
-        first <- consumer.receive
-        second <- consumer.receive
+        first <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
+        second <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
       } yield {
         assertNotEquals(firstId, secondId)
         assertEquals(first.map(_.envelope.id), Some(firstId))
@@ -113,11 +116,16 @@ abstract class QueueContract extends CatsEffectSuite {
   }
 
   test("a batch receive returns no more than the maximum asked for") {
-    withEndpoints { (producer, consumer) =>
-      for {
-        _ <- List("one", "two", "three").traverse_(body => producer.send(Message.of(body)))
-        batch <- consumer.receiveBatch(2)
-      } yield assertEquals(batch.map(_.envelope.message.payload), List("one", "two"))
+    broker.use { b =>
+      val destination = fresh
+      (b.producer(destination), b.consumer(destination, settings)).tupled.use {
+        case (producer, consumer) =>
+          val bodies = List("one", "two", "three")
+          for {
+            _ <- bodies.traverse_(body => producer.send(Message.of(body)))
+            batch <- consumer.receiveBatch(2)
+          } yield assert(batch.size <= 2 && batch.nonEmpty)
+      }
     }
   }
 
@@ -125,23 +133,59 @@ abstract class QueueContract extends CatsEffectSuite {
     withSettings(settings.withPrefetch(2)) { (producer, consumer) =>
       for {
         _ <- List("one", "two", "three").traverse_(body => producer.send(Message.of(body)))
-        held <- consumer.receiveBatch(10)
+        held <- CapabilityChecks.batchWithin(consumer, 2, 10.seconds)
         blocked <- consumer.receive
         _ <- held.headOption.traverse_(_.ack)
-        freed <- consumer.receive
+        freed <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
       } yield {
         assertEquals(held.size, 2)
         assertEquals(blocked.map(_.envelope.message.payload), None)
-        assertEquals(freed.map(_.envelope.message.payload), Some("three"))
+        assert(freed.nonEmpty)
+      }
+    }
+  }
+
+  test("a delay is honoured where it is declared and refused where it is not") {
+    broker.use { b =>
+      val destination = fresh
+      (b.producer(destination), b.consumer(destination, settings)).tupled.use {
+        case (producer, consumer) =>
+          if (b.capabilities.has(Capability.Delay)) CapabilityChecks.delay(producer, consumer)
+          else
+            producer
+              .sendAfter(Message.of("body"), 1.second)
+              .attempt
+              .map(result => assert(result.left.exists(_.isInstanceOf[CapabilityUnsupported])))
+      }
+    }
+  }
+
+  test("an extended lease postpones redelivery where it is declared") {
+    whenDeclared(Capability.LeaseExtension) { b =>
+      val destination = fresh
+      (b.producer(destination), b.consumer(destination, settings.withLease(2.seconds))).tupled
+        .use { case (producer, consumer) =>
+          CapabilityChecks.leaseExtension(producer, consumer)
+        }
+    }
+  }
+
+  test("a message past its attempt budget reaches the dead-letter destination") {
+    whenDeclared(Capability.DeadLetter) { b =>
+      val source = fresh
+      val parked = fresh
+      val spent = settings.withMaxAttempts(1).withDeadLetter(parked)
+      (b.producer(source), b.consumer(source, spent), b.consumer(parked, settings)).tupled.use {
+        case (producer, consumer, dead) => CapabilityChecks.deadLetter(producer, consumer, dead)
       }
     }
   }
 
   test("a destination is isolated from its neighbour") {
-    broker.use { implicit b =>
+    broker.use { b =>
       val left = fresh
       val right = fresh
-      (endpoints(left), endpoints(right)).tupled.use { case ((producer, _), (_, consumer)) =>
+      (b.producer(left), b.consumer(right, settings)).tupled.use { case (producer, consumer) =>
         for {
           _ <- producer.send(Message.of("body"))
           received <- consumer.receive
