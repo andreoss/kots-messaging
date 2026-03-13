@@ -35,3 +35,11 @@ lazy val kafka = project
   .settings(libraryDependencies += kafkaClients)
   .settings(Test / fork := true)
   .dependsOn(core % "compile->compile;test->test")
+
+lazy val amqp = project
+  .in(file("modules/amqp"))
+  .settings(commonSettings)
+  .settings(name := "kots-mq-amqp")
+  .settings(libraryDependencies += amqpClient)
+  .settings(Test / fork := true)
+  .dependsOn(core % "compile->compile;test->test")

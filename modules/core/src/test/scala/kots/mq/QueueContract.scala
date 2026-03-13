@@ -18,8 +18,10 @@ abstract class QueueContract extends CatsEffectSuite {
 
   private val counter = new AtomicInteger(0)
 
+  private val nonce: String = java.lang.Long.toHexString(System.nanoTime())
+
   private def fresh: Destination =
-    Destination(s"${getClass.getSimpleName}-${counter.incrementAndGet()}")
+    Destination(s"${getClass.getSimpleName}-$nonce-${counter.incrementAndGet()}")
 
   private def withEndpoints[A](
     f: (Producer[IO, String], Consumer[IO, String]) => IO[A]
@@ -43,7 +45,7 @@ abstract class QueueContract extends CatsEffectSuite {
     withEndpoints { (producer, consumer) =>
       for {
         _ <- producer.send(message)
-        received <- consumer.receive
+        received <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
       } yield assertEquals(received.map(_.envelope.message), Some(message))
     }
   }
@@ -52,7 +54,7 @@ abstract class QueueContract extends CatsEffectSuite {
     withEndpoints { (producer, consumer) =>
       for {
         _ <- producer.send(Message.of("body"))
-        received <- consumer.receive
+        received <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
       } yield assertEquals(received.map(_.envelope.attempt), Some(1))
     }
   }
@@ -61,7 +63,7 @@ abstract class QueueContract extends CatsEffectSuite {
     withEndpoints { (producer, consumer) =>
       for {
         _ <- producer.send(Message.of("body"))
-        first <- consumer.receive
+        first <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
         _ <- first.traverse_(_.ack)
         second <- consumer.receive
       } yield assertEquals(second.map(_.envelope.message.payload), None)
@@ -72,7 +74,7 @@ abstract class QueueContract extends CatsEffectSuite {
     withEndpoints { (producer, consumer) =>
       for {
         _ <- producer.send(Message.of("body"))
-        first <- consumer.receive
+        first <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
         _ <- first.traverse_(_.reject)
         second <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
       } yield {
@@ -123,8 +125,8 @@ abstract class QueueContract extends CatsEffectSuite {
           val bodies = List("one", "two", "three")
           for {
             _ <- bodies.traverse_(body => producer.send(Message.of(body)))
-            batch <- consumer.receiveBatch(2)
-          } yield assert(batch.size <= 2 && batch.nonEmpty)
+            batch <- CapabilityChecks.batchWithin(consumer, 2, 10.seconds)
+          } yield assert(batch.size == 2)
       }
     }
   }

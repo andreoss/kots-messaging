@@ -9,6 +9,8 @@ object Dependencies {
 
   val kafkaClients = "org.apache.kafka" % "kafka-clients" % "3.9.1"
 
+  val amqpClient = "com.rabbitmq" % "amqp-client" % "5.25.0"
+
   val scala213 = "2.13.18"
   val scala3 = "3.3.8"
 
