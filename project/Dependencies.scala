@@ -11,6 +11,11 @@ object Dependencies {
 
   val amqpClient = "com.rabbitmq" % "amqp-client" % "5.25.0"
 
+  val awsSqs = "software.amazon.awssdk" % "sqs" % "2.55.0"
+  val jmsApi = "jakarta.jms" % "jakarta.jms-api" % "3.1.0"
+  val activemqClient = "org.apache.activemq" % "activemq-client-jakarta" % "6.1.0" % Test
+  val artemisClient = "org.apache.activemq" % "artemis-jakarta-client" % "2.57.0" % Test
+
   val scala213 = "2.13.18"
   val scala3 = "3.3.8"
 

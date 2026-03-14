@@ -6,4 +6,17 @@ import scala.concurrent.duration.FiniteDuration
 trait Producer[F[_], A] {
   def send(message: Message[A]): F[MessageId]
   def sendAfter(message: Message[A], delay: FiniteDuration): F[MessageId]
+  def sendBatch(messages: List[Message[A]]): F[List[Either[SendFailure, MessageId]]]
+}
+
+/** Why one entry of a batch was not published; carries no payload. */
+final case class SendFailure(code: String, description: String)
+
+object SendFailure {
+
+  def of(error: Throwable): SendFailure =
+    SendFailure(
+      error.getClass.getSimpleName,
+      Option(error.getMessage).getOrElse(error.getClass.getName),
+    )
 }

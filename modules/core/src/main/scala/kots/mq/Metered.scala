@@ -19,6 +19,12 @@ object Metered {
       def sendAfter(message: Message[A], delay: FiniteDuration): F[MessageId] =
         measured(underlying.sendAfter(message, delay))
 
+      def sendBatch(messages: List[Message[A]]): F[List[Either[SendFailure, MessageId]]] =
+        clock.timed(underlying.sendBatch(messages)).flatMap { case (elapsed, outcomes) =>
+          metrics.publishLatency(elapsed) *>
+            outcomes.traverse_(outcome => metrics.published.whenA(outcome.isRight)).as(outcomes)
+        }
+
       private def measured(publish: F[MessageId]): F[MessageId] =
         clock.timed(publish).flatMap { case (elapsed, id) =>
           metrics.publishLatency(elapsed) *> metrics.published.as(id)

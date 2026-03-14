@@ -43,3 +43,19 @@ lazy val amqp = project
   .settings(libraryDependencies += amqpClient)
   .settings(Test / fork := true)
   .dependsOn(core % "compile->compile;test->test")
+
+lazy val sqs = project
+  .in(file("modules/sqs"))
+  .settings(commonSettings)
+  .settings(name := "kots-mq-sqs")
+  .settings(libraryDependencies += awsSqs)
+  .settings(Test / fork := true)
+  .dependsOn(core % "compile->compile;test->test")
+
+lazy val jms = project
+  .in(file("modules/jms"))
+  .settings(commonSettings)
+  .settings(name := "kots-mq-jms")
+  .settings(libraryDependencies ++= Seq(jmsApi, activemqClient, artemisClient))
+  .settings(Test / fork := true)
+  .dependsOn(core % "compile->compile;test->test")

@@ -102,6 +102,11 @@ private final class KafkaBroker[F[_]](
 
       def sendAfter(message: Message[Array[Byte]], delay: FiniteDuration): F[MessageId] =
         F.raiseError(CapabilityUnsupported(Capability.Delay))
+
+      def sendBatch(
+        messages: List[Message[Array[Byte]]]
+      ): F[List[Either[SendFailure, MessageId]]] =
+        messages.traverse(message => send(message).attempt.map(_.leftMap(SendFailure.of)))
     })
 
   def consumer(

@@ -14,6 +14,9 @@ object Transcode {
 
       def sendAfter(message: Message[A], delay: FiniteDuration): F[MessageId] =
         underlying.sendAfter(encode(message, codec), delay)
+
+      def sendBatch(messages: List[Message[A]]): F[List[Either[SendFailure, MessageId]]] =
+        underlying.sendBatch(messages.map(encode(_, codec)))
     }
 
   def consumer[F[_], A](underlying: Consumer[F, Array[Byte]], codec: Codec[A])(implicit

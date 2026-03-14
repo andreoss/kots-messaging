@@ -25,6 +25,11 @@ object StubBroker {
             def sendAfter(message: Message[A], delay: FiniteDuration): F[MessageId] =
               if (declared.has(Capability.Delay)) send(message)
               else F.raiseError(CapabilityUnsupported(Capability.Delay))
+
+            def sendBatch(
+              messages: List[Message[A]]
+            ): F[List[Either[SendFailure, MessageId]]] =
+              messages.traverse(message => send(message).attempt.map(_.leftMap(SendFailure.of)))
           })
 
         def consumer(

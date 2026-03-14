@@ -58,6 +58,9 @@ private final class MemBroker[F[_], A](
       def send(message: Message[A]): F[MessageId] =
         sendAfter(message, FiniteDuration(0L, java.util.concurrent.TimeUnit.NANOSECONDS))
 
+      def sendBatch(messages: List[Message[A]]): F[List[Either[SendFailure, MessageId]]] =
+        messages.traverse(message => send(message).attempt.map(_.leftMap(SendFailure.of)))
+
       def sendAfter(message: Message[A], delay: FiniteDuration): F[MessageId] =
         F.monotonic.flatMap { now =>
           state.modify { current =>

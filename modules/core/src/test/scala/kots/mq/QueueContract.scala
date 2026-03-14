@@ -131,6 +131,21 @@ abstract class QueueContract extends CatsEffectSuite {
     }
   }
 
+  test("a batch send reports an outcome for every message") {
+    val bodies = List("one", "two", "three")
+    withEndpoints { (producer, consumer) =>
+      for {
+        outcomes <- producer.sendBatch(bodies.map(Message.of))
+        received <- CapabilityChecks.batchWithin(consumer, bodies.size, 30.seconds)
+        _ <- received.traverse_(_.ack)
+      } yield {
+        assertEquals(outcomes.size, bodies.size)
+        assert(outcomes.forall(_.isRight), outcomes.toString)
+        assertEquals(received.map(_.envelope.message.payload).sorted, bodies.sorted)
+      }
+    }
+  }
+
   test("a consumer holding its prefetch receives nothing more") {
     withSettings(settings.withPrefetch(2)) { (producer, consumer) =>
       for {

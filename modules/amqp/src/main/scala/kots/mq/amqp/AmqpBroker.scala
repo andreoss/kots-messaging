@@ -78,6 +78,11 @@ private final class AmqpBroker[F[_]](
       def send(message: Message[Array[Byte]]): F[MessageId] =
         publish(channel, guard, returned, destination.name, message, 1, None)
 
+      def sendBatch(
+        messages: List[Message[Array[Byte]]]
+      ): F[List[Either[SendFailure, MessageId]]] =
+        messages.traverse(message => send(message).attempt.map(_.leftMap(SendFailure.of)))
+
       def sendAfter(message: Message[Array[Byte]], delay: FiniteDuration): F[MessageId] = {
         val holding = s"${destination.name}.delay"
         for {
