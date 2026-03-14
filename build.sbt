@@ -59,3 +59,25 @@ lazy val jms = project
   .settings(libraryDependencies ++= Seq(jmsApi, activemqClient, artemisClient))
   .settings(Test / fork := true)
   .dependsOn(core % "compile->compile;test->test")
+
+lazy val stream = project
+  .in(file("modules/stream"))
+  .settings(commonSettings)
+  .settings(name := "kots-mq-stream")
+  .settings(libraryDependencies += fs2Core)
+  .dependsOn(core % "compile->compile;test->test", mem % "test->compile")
+
+lazy val interop = project
+  .in(file("modules/interop"))
+  .settings(commonSettings)
+  .settings(name := "kots-mq-interop")
+  .settings(libraryDependencies ++= Seq(zio, zioInteropCats))
+  .dependsOn(core % "compile->compile;test->test", mem % "test->compile")
+
+lazy val prometheus = project
+  .in(file("modules/prometheus"))
+  .settings(commonSettings)
+  .settings(name := "kots-mq-prometheus")
+  .settings(libraryDependencies ++= Seq(prometheusCore, prometheusHttpServer))
+  .settings(Test / fork := true)
+  .dependsOn(core % "compile->compile;test->test", mem % "test->compile")

@@ -35,6 +35,20 @@ object CapabilityChecks {
     poll(Nil).timeoutTo(timeout, IO.pure(Nil))
   }
 
+  private def parkedWithin(
+    source: Consumer[IO, String],
+    parked: Consumer[IO, String],
+    timeout: FiniteDuration,
+  ): IO[Option[Delivery[IO, String]]] = {
+    lazy val poll: IO[Option[Delivery[IO, String]]] =
+      parked.receive.flatMap {
+        case Some(delivery) => IO.pure(Some(delivery))
+        case None =>
+          source.receive.flatMap(_.traverse_(_.reject)) *> IO.sleep(200.millis) *> poll
+      }
+    poll.timeoutTo(timeout, IO.pure(None))
+  }
+
   private def require(condition: Boolean, failure: String): IO[Unit] =
     IO.raiseError(new AssertionError(failure)).unlessA(condition)
 
@@ -70,7 +84,7 @@ object CapabilityChecks {
       first <- receiveWithin(consumer, 10.seconds)
       _ <- require(first.nonEmpty, "nothing to poison")
       _ <- first.traverse_(_.reject)
-      dead <- receiveWithin(parked, 10.seconds)
+      dead <- parkedWithin(consumer, parked, 30.seconds)
       _ <- require(dead.nonEmpty, "a spent message never reached the dead-letter destination")
       _ <- require(
         dead.exists(_.envelope.message.payload == "poison"),

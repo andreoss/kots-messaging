@@ -6,7 +6,23 @@ import kots.mq._
 import software.amazon.awssdk.auth.credentials.{AwsBasicCredentials, StaticCredentialsProvider}
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.sqs.SqsClient
-import software.amazon.awssdk.services.sqs.model._
+import software.amazon.awssdk.services.sqs.model.{
+  ChangeMessageVisibilityRequest,
+  CreateQueueRequest,
+  DeleteMessageRequest,
+  GetQueueAttributesRequest,
+  GetQueueUrlRequest,
+  Message => SqsMessage,
+  MessageAttributeValue,
+  MessageSystemAttributeName,
+  QueueAttributeName,
+  QueueDoesNotExistException,
+  ReceiveMessageRequest,
+  SendMessageBatchRequest,
+  SendMessageBatchRequestEntry,
+  SendMessageRequest,
+  SetQueueAttributesRequest,
+}
 
 import java.net.URI
 import scala.concurrent.duration.FiniteDuration

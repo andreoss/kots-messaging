@@ -54,3 +54,8 @@ services:
       ARTEMIS_USER: artemis
       ARTEMIS_PASSWORD: artemis
       ANONYMOUS_LOGIN: "false"
+  prometheus:
+    image: docker.io/prom/prometheus:v3.5.0
+    network_mode: host
+    volumes:
+      - ./scripts/prometheus.yml:/etc/prometheus/prometheus.yml:ro

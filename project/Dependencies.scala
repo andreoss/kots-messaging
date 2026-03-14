@@ -16,6 +16,14 @@ object Dependencies {
   val activemqClient = "org.apache.activemq" % "activemq-client-jakarta" % "6.1.0" % Test
   val artemisClient = "org.apache.activemq" % "artemis-jakarta-client" % "2.57.0" % Test
 
+  val fs2Core = "co.fs2" %% "fs2-core" % "3.14.0"
+  val zio = "dev.zio" %% "zio" % "2.1.26" % Test
+  val zioInteropCats = "dev.zio" %% "zio-interop-cats" % "23.1.0.13" % Test
+
+  val prometheusCore = "io.prometheus" % "prometheus-metrics-core" % "1.9.0"
+  val prometheusHttpServer =
+    "io.prometheus" % "prometheus-metrics-exporter-httpserver" % "1.9.0" % Test
+
   val scala213 = "2.13.18"
   val scala3 = "3.3.8"
 
