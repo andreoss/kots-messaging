@@ -198,6 +198,21 @@ abstract class QueueContract extends CatsEffectSuite {
     }
   }
 
+  test("the admin port reports a depth or nothing at all") {
+    broker.use { b =>
+      val destination = fresh
+      (b.producer(destination), b.consumer(destination, settings)).tupled.use {
+        case (producer, consumer) =>
+          for {
+            _ <- producer.send(Message.of("body"))
+            depth <- b.admin.depth(destination)
+            received <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
+            _ <- received.traverse_(_.ack)
+          } yield depth.foreach(value => assert(value >= 0L, s"a depth of $value"))
+      }
+    }
+  }
+
   test("a destination is isolated from its neighbour") {
     broker.use { b =>
       val left = fresh

@@ -4,7 +4,7 @@ import cats.effect.kernel.{Ref, Resource, Temporal}
 import cats.syntax.all._
 import kots.mq._
 
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration.{Duration, FiniteDuration}
 
 /** In-memory broker over a single reference; the contract's baseline. */
 object MemBroker {
@@ -22,6 +22,7 @@ object MemBroker {
     expiresAt: FiniteDuration,
     settings: ConsumerSettings,
     holder: ConsumerId,
+    token: Long,
   )
 
   private[mem] final case class State[A](
@@ -29,10 +30,11 @@ object MemBroker {
     leased: Map[MessageId, Leased[A]],
     published: Long,
     consumers: Long,
+    leases: Long,
   )
 
   private[mem] object State {
-    def empty[A]: State[A] = State(Map.empty, Map.empty, 0L, 0L)
+    def empty[A]: State[A] = State(Map.empty, Map.empty, 0L, 0L, 0L)
   }
 }
 
@@ -52,11 +54,17 @@ private final class MemBroker[F[_], A](
       Capability.LeaseExtension,
     )
 
+  val admin: Admin[F] = new Admin[F] {
+    def depth(destination: Destination): F[Option[Long]] =
+      state.get.map(current =>
+        Some(current.ready.getOrElse(destination, Vector.empty).size.toLong)
+      )
+  }
+
   def producer(destination: Destination): Resource[F, Producer[F, A]] =
     Resource.pure(new Producer[F, A] {
 
-      def send(message: Message[A]): F[MessageId] =
-        sendAfter(message, FiniteDuration(0L, java.util.concurrent.TimeUnit.NANOSECONDS))
+      def send(message: Message[A]): F[MessageId] = sendAfter(message, Duration.Zero)
 
       def sendBatch(messages: List[Message[A]]): F[List[Either[SendFailure, MessageId]]] =
         messages.traverse(message => send(message).attempt.map(_.leftMap(SendFailure.of)))
@@ -65,7 +73,7 @@ private final class MemBroker[F[_], A](
         F.monotonic.flatMap { now =>
           state.modify { current =>
             val id = MessageId((current.published + 1).toString)
-            val visibleAt = if (delay > FiniteDuration(0L, java.util.concurrent.TimeUnit.NANOSECONDS)) now + delay else now
+            val visibleAt = if (delay > Duration.Zero) now + delay else now
             val pending = Pending(Envelope(id, message, 1), visibleAt)
             (push(current, destination, pending).copy(published = current.published + 1), id)
           }
@@ -77,7 +85,11 @@ private final class MemBroker[F[_], A](
     settings: ConsumerSettings,
   ): Resource[F, Consumer[F, A]] =
     Resource
-      .eval(state.modify(current => (current.copy(consumers = current.consumers + 1), ConsumerId(current.consumers + 1))))
+      .eval(
+        state.modify(current =>
+          (current.copy(consumers = current.consumers + 1), ConsumerId(current.consumers + 1))
+        )
+      )
       .map(holder =>
         new Consumer[F, A] {
 
@@ -88,29 +100,33 @@ private final class MemBroker[F[_], A](
               now <- F.monotonic
               sample <- entropy.nextDouble
               taken <- state.modify(take(_, destination, settings, holder, now, sample, max))
-            } yield taken.map(delivery)
+            } yield taken.map { case (envelope, token) => delivery(envelope, token) }
         }
       )
 
-  private def delivery(taken: Envelope[A]): Delivery[F, A] =
+  private def delivery(taken: Envelope[A], token: Long): Delivery[F, A] =
     new Delivery[F, A] {
+
       val envelope: Envelope[A] = taken
 
-      val ack: F[Unit] = state.update(current => current.copy(leased = current.leased - taken.id))
+      val ack: F[Unit] =
+        state.update(current =>
+          held(current).fold(current)(_ => current.copy(leased = current.leased - taken.id))
+        )
 
       val reject: F[Unit] =
         for {
           now <- F.monotonic
           sample <- entropy.nextDouble
           _ <- state.update { current =>
-            current.leased.get(taken.id) match {
+            held(current) match {
               case None => current
-              case Some(held) =>
+              case Some(lease) =>
                 requeue(
                   current.copy(leased = current.leased - taken.id),
-                  held.destination,
-                  held.envelope,
-                  held.settings,
+                  lease.destination,
+                  lease.envelope,
+                  lease.settings,
                   now,
                   sample,
                 )
@@ -121,15 +137,16 @@ private final class MemBroker[F[_], A](
       def extend(by: FiniteDuration): F[Unit] =
         F.monotonic.flatMap { now =>
           state.update { current =>
-            current.leased
-              .get(taken.id)
-              .fold(current)(held =>
-                current.copy(
-                  leased = current.leased.updated(taken.id, held.copy(expiresAt = now + by))
-                )
+            held(current).fold(current)(lease =>
+              current.copy(
+                leased = current.leased.updated(taken.id, lease.copy(expiresAt = now + by))
               )
+            )
           }
         }
+
+      private def held(current: State[A]): Option[Leased[A]] =
+        current.leased.get(taken.id).filter(_.token == token)
     }
 
   private def take(
@@ -140,16 +157,16 @@ private final class MemBroker[F[_], A](
     now: FiniteDuration,
     sample: Double,
     max: Int,
-  ): (State[A], List[Envelope[A]]) = {
+  ): (State[A], List[(Envelope[A], Long)]) = {
     val swept = sweep(current, now, sample)
-    val held = swept.leased.values.count(_.holder == holder)
-    val capacity = math.max(0, math.min(max, settings.prefetch - held))
+    val inflight = swept.leased.values.count(_.holder == holder)
+    val capacity = math.max(0, math.min(max, settings.prefetch - inflight))
 
     def loop(
       accumulated: State[A],
       left: Int,
-      taken: List[Envelope[A]],
-    ): (State[A], List[Envelope[A]]) =
+      taken: List[(Envelope[A], Long)],
+    ): (State[A], List[(Envelope[A], Long)]) =
       if (left <= 0) (accumulated, taken.reverse)
       else {
         val queue = accumulated.ready.getOrElse(destination, Vector.empty)
@@ -157,15 +174,17 @@ private final class MemBroker[F[_], A](
           case -1 => (accumulated, taken.reverse)
           case index =>
             val pending = queue(index)
+            val token = accumulated.leases + 1L
             val lease =
-              Leased(destination, pending.envelope, now + settings.lease, settings, holder)
+              Leased(destination, pending.envelope, now + settings.lease, settings, holder, token)
             loop(
               accumulated.copy(
                 ready = accumulated.ready.updated(destination, queue.patch(index, Vector.empty, 1)),
                 leased = accumulated.leased.updated(pending.envelope.id, lease),
+                leases = token,
               ),
               left - 1,
-              pending.envelope :: taken,
+              (pending.envelope, token) :: taken,
             )
         }
       }
@@ -176,8 +195,8 @@ private final class MemBroker[F[_], A](
   private def sweep(current: State[A], now: FiniteDuration, sample: Double): State[A] = {
     val expired = current.leased.values.filter(_.expiresAt <= now).toList
     expired.foldLeft(current.copy(leased = current.leased -- expired.map(_.envelope.id))) {
-      (acc, held) =>
-        requeue(acc, held.destination, held.envelope, held.settings, now, sample)
+      (acc, lease) =>
+        requeue(acc, lease.destination, lease.envelope, lease.settings, now, sample)
     }
   }
 

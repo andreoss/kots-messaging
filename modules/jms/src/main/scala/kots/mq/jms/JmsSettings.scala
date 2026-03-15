@@ -4,9 +4,7 @@ import jakarta.jms.Session
 
 import scala.concurrent.duration._
 
-/** How a session acknowledges, how long a receive blocks, what the provider
-  * honours.
-  */
+/** How a session acknowledges and what the provider honours. */
 final case class JmsSettings(
   acknowledgeMode: Int,
   receiveTimeout: FiniteDuration,

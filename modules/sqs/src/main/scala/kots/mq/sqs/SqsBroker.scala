@@ -68,6 +68,27 @@ private final class SqsBroker[F[_]](
       Capability.LeaseExtension,
     )
 
+  val admin: Admin[F] = new Admin[F] {
+    def depth(destination: Destination): F[Option[Long]] =
+      queueUrl(destination)
+        .flatMap(url =>
+          F.blocking(
+            client
+              .getQueueAttributes(
+                GetQueueAttributesRequest
+                  .builder()
+                  .queueUrl(url)
+                  .attributeNames(QueueAttributeName.APPROXIMATE_NUMBER_OF_MESSAGES)
+                  .build()
+              )
+              .attributes()
+              .get(QueueAttributeName.APPROXIMATE_NUMBER_OF_MESSAGES)
+          )
+        )
+        .map(value => Option(value).flatMap(_.toLongOption))
+        .recover { case _: Throwable => None }
+  }
+
   def producer(destination: Destination): Resource[F, Producer[F, Array[Byte]]] =
     Resource.eval(queueUrl(destination)).map { url =>
       new Producer[F, Array[Byte]] {

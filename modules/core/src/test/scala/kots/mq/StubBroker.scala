@@ -14,6 +14,11 @@ object StubBroker {
 
         val capabilities: Capabilities = declared
 
+        val admin: Admin[F] = new Admin[F] {
+          def depth(destination: Destination): F[Option[Long]] =
+            state.get.map { case (queue, _) => Some(queue.size.toLong) }
+        }
+
         def producer(destination: Destination): Resource[F, Producer[F, A]] =
           Resource.pure(new Producer[F, A] {
             def send(message: Message[A]): F[MessageId] =

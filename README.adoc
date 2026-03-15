@@ -7,11 +7,12 @@ it. The core depends on Cats and Cats Effect only.
 ## Algebra
 
 `Producer[F, A]` publishes; `Consumer[F, A]` hands out `Delivery[F, A]`
-values that carry `ack`, `reject` and `extend`. Settling is the caller's:
-nothing is acknowledged because an effect completed.
+values carrying `ack`, `reject` and `extend`. Settling is the caller's:
+nothing is acknowledged because an effect happened to complete.
 
 ```scala
 import cats.effect.IO
+import cats.syntax.all._
 import kots.mq._
 import kots.mq.mem.MemBroker
 
@@ -29,9 +30,28 @@ for {
 ```
 
 `ConsumerSettings` carries the lease, the attempt budget, the prefetch bound,
-the `Backoff` policy and an optional dead-letter destination. `Metered` wraps
-a producer or consumer with the metrics port; `Transcode` carries the algebra
-from wire bytes to a typed payload through a `Codec`.
+the `Backoff` policy and an optional dead-letter destination.
+`Semantics.atMostOnce` and `Semantics.atLeastOnce` write the delivery mode at
+the call site. `Metered` wraps a producer or consumer with the metrics port,
+`Transcode` carries the algebra from wire bytes to a typed payload through a
+`Codec`, and `Broker.admin` reports a destination's depth where the broker
+publishes one.
+
+## Brokers
+
+| Broker | Module | Acknowledgement | Capabilities | Tier |
+| --- | --- | --- | --- | --- |
+| In-memory | `mem` | in-process lease | batch, delay, dead-letter, lease extension | unit |
+| Apache Kafka | `kafka` | offset commit | batch, dead-letter, ordering group | e2e |
+| RabbitMQ | `amqp` | channel ack | batch, delay, dead-letter | e2e |
+| Amazon SQS | `sqs` | delete message | batch, delay, dead-letter, lease extension | e2e |
+| ActiveMQ, Artemis | `jms` | per-message ack | batch, dead-letter, and delay and priority where the provider has them | e2e |
+
+`stream` adds an fs2 layer, `interop` carries the algebra into the other
+effect system, `prometheus` binds the metrics and depth ports, `bench` times
+the in-memory adapter against a bare queue. Every adapter passes the same
+contract suite, and an optional feature is tested only where the adapter
+declares it.
 
 ## Build and test
 
@@ -39,10 +59,14 @@ from wire bytes to a typed payload through a `Codec`.
 
 The unit tier needs no services.
 
-## Test tiers
+## E2e tier
 
-Adapters over live brokers run against the compose stack:
+The adapters over live brokers run against the compose stack:
 
     docker compose up -d --wait
-    sbt -batch +test
+    ./scripts/artemis-init.sh
+    sbt -batch kafka/test amqp/test sqs/test jms/test prometheus/test
     docker compose down
+
+The metrics suite serves a live workload on `127.0.0.1:19096` and asserts the
+composed Prometheus scrapes its series back.

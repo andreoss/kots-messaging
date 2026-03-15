@@ -43,14 +43,13 @@ object Metered {
         measured(underlying.receiveBatch(max))
 
       private def measured(read: F[List[Delivery[F, A]]]): F[List[Delivery[F, A]]] =
-        for {
-          timed <- clock.timed(read)
-          _ <- metrics.receiveLatency(timed._1)
-          _ <- timed._2.traverse_(delivery =>
-            metrics.received *> metrics.redelivered.whenA(delivery.envelope.attempt > 1)
-          )
-          at <- clock.monotonic
-        } yield timed._2.map(settled(_, metrics, at))
+        clock.timed(read).flatMap { case (elapsed, deliveries) =>
+          metrics.receiveLatency(elapsed) *>
+            deliveries.traverse_(delivery =>
+              metrics.received *> metrics.redelivered.whenA(delivery.envelope.attempt > 1)
+            ) *>
+            clock.monotonic.map(at => deliveries.map(settled(_, metrics, at)))
+        }
     }
 
   private def settled[F[_], A](

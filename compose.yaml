@@ -57,5 +57,8 @@ services:
   prometheus:
     image: docker.io/prom/prometheus:v3.5.0
     network_mode: host
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.listen-address=127.0.0.1:9091"
     volumes:
       - ./scripts/prometheus.yml:/etc/prometheus/prometheus.yml:ro

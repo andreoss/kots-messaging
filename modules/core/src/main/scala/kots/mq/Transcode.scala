@@ -39,6 +39,8 @@ object Transcode {
     new Broker[F, A] {
       val capabilities: Capabilities = underlying.capabilities
 
+      val admin: Admin[F] = underlying.admin
+
       def producer(destination: Destination): cats.effect.kernel.Resource[F, Producer[F, A]] =
         underlying.producer(destination).map(Transcode.producer(_, codec))
 

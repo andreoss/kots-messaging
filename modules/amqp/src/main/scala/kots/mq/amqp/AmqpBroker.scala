@@ -10,9 +10,7 @@ import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 
-/** AMQP 0-9-1 adapter: acknowledgement, prefetch and dead-letter are the
-  * broker's own.
-  */
+/** AMQP 0-9-1 adapter over the broker's own acknowledgement and routing. */
 object AmqpBroker {
 
   private[amqp] val attemptHeader = "x-mq-attempt"
@@ -48,6 +46,15 @@ private final class AmqpBroker[F[_]](
 
   val capabilities: Capabilities =
     Capabilities.of(Capability.Batch, Capability.Delay, Capability.DeadLetter)
+
+  val admin: Admin[F] = new Admin[F] {
+    def depth(destination: Destination): F[Option[Long]] =
+      channelResource
+        .use(channel =>
+          F.blocking(Option(channel.queueDeclarePassive(destination.name).getMessageCount.toLong))
+        )
+        .recover { case _: Throwable => None }
+  }
 
   private def channelResource: Resource[F, Channel] =
     Resource.make(F.blocking(connection.createChannel()))(channel => F.blocking(channel.close()))
@@ -162,16 +169,18 @@ private final class AmqpBroker[F[_]](
           for {
             held <- inflight.get
             room = math.max(0, math.min(max, consumerSettings.prefetch - held.size))
-            responses <- List.range(0, room).foldLeftM(List.empty[GetResponse]) {
-              (taken, _) =>
-                if (taken.size < room)
-                  F.blocking(Option(channel.basicGet(destination.name, false)))
-                    .map(_.fold(taken)(taken :+ _))
-                else F.pure(taken)
-            }
+            responses <- fetch(room, Nil)
             _ <- inflight.update(_ ++ responses.map(_.getEnvelope.getDeliveryTag))
           } yield responses.map(delivered)
         }
+
+      private def fetch(room: Int, taken: List[GetResponse]): F[List[GetResponse]] =
+        if (taken.size >= room) F.pure(taken)
+        else
+          F.blocking(Option(channel.basicGet(destination.name, false))).flatMap {
+            case Some(response) => fetch(room, taken :+ response)
+            case None => F.pure(taken)
+          }
 
       private def delivered(response: GetResponse): Delivery[F, Array[Byte]] =
         new Delivery[F, Array[Byte]] {
@@ -235,14 +244,15 @@ private final class AmqpBroker[F[_]](
 
   private def unroutable(returned: AtomicReference[Option[String]]): F[Option[String]] =
     if (!settings.mandatory) F.pure(None)
-    else
-      List
-        .range(0, 5)
-        .foldLeftM(Option.empty[String]) { (found, _) =>
-          found.fold(F.delay(returned.get).flatTap(seen => F.sleep(100.millis).whenA(seen.isEmpty)))(
-            existing => F.pure(Some(existing))
-          )
+    else {
+      def poll(left: Int): F[Option[String]] =
+        F.delay(returned.get).flatMap {
+          case found @ Some(_) => F.pure(found)
+          case None if left > 0 => F.sleep(100.millis) *> poll(left - 1)
+          case None => F.pure(None)
         }
+      poll(5)
+    }
 
   private def publish(
     channel: Channel,

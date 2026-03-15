@@ -15,7 +15,7 @@ lazy val commonSettings = Seq(
 lazy val root = (project in file("."))
   .settings(commonSettings)
   .settings(name := "kots-mq", publish / skip := true)
-  .aggregate(core, mem)
+  .aggregate(core, mem, stream, interop, bench)
 
 lazy val core = project
   .in(file("modules/core"))
@@ -81,3 +81,9 @@ lazy val prometheus = project
   .settings(libraryDependencies ++= Seq(prometheusCore, prometheusHttpServer))
   .settings(Test / fork := true)
   .dependsOn(core % "compile->compile;test->test", mem % "test->compile")
+
+lazy val bench = project
+  .in(file("modules/bench"))
+  .settings(commonSettings)
+  .settings(name := "kots-mq-bench")
+  .dependsOn(core, mem)

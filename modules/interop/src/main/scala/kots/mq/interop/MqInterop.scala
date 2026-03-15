@@ -18,6 +18,10 @@ object MqInterop {
 
       val capabilities: Capabilities = broker.capabilities
 
+      val admin: Admin[G] = new Admin[G] {
+        def depth(destination: Destination): G[Option[Long]] = fk(broker.admin.depth(destination))
+      }
+
       def producer(destination: Destination): Resource[G, Producer[G, A]] =
         broker.producer(destination).mapK(fk).map(producerK(_)(fk))
 

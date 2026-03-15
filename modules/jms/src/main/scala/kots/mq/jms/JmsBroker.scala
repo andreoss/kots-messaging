@@ -13,6 +13,8 @@ import jakarta.jms.{
 }
 import kots.mq._
 
+import java.nio.charset.StandardCharsets.UTF_8
+
 import scala.concurrent.duration.FiniteDuration
 
 /** Jakarta Messaging adapter; one session per producer and per consumer. */
@@ -20,7 +22,26 @@ object JmsBroker {
 
   private[jms] val attemptProperty = "x_mq_attempt"
   private[jms] val keyProperty = "x_mq_key"
+  private[jms] val headerPrefix = "x_mq_h_"
   private[jms] val priorityHeader = "x-mq-priority"
+
+  /** Property name for a header, so any header name is a valid identifier. */
+  private[jms] def propertyOf(header: String): String =
+    headerPrefix + header.getBytes(UTF_8).map(byte => f"${byte & 0xff}%02x").mkString
+
+  private[jms] def headerOf(property: String): Option[String] =
+    if (!property.startsWith(headerPrefix)) None
+    else {
+      val hex = property.drop(headerPrefix.length)
+      if (hex.length % 2 != 0) None
+      else
+        Some(
+          new String(
+            hex.grouped(2).map(pair => Integer.parseInt(pair, 16).toByte).toArray,
+            UTF_8,
+          )
+        )
+    }
 
   def bytes[F[_]](
     factory: ConnectionFactory,
@@ -50,6 +71,8 @@ private final class JmsBroker[F[_]](
     val withDelay = if (settings.delaySupported) base.and(Capability.Delay) else base
     if (settings.prioritySupported) withDelay.and(Capability.Priority) else withDelay
   }
+
+  val admin: Admin[F] = Admin.unknown[F]
 
   private def sessionResource(mode: Int): Resource[F, Session] =
     Resource.make(F.blocking(connection.createSession(false, mode)))(session =>
@@ -100,15 +123,18 @@ private final class JmsBroker[F[_]](
           for {
             held <- inflight.get
             room = math.max(0, math.min(max, consumerSettings.prefetch - held.size))
-            messages <- List.range(0, room).foldLeftM(List.empty[JmsMessage]) { (taken, _) =>
-              if (taken.size < room)
-                F.blocking(Option(reader.receive(settings.receiveTimeout.toMillis)))
-                  .map(_.fold(taken)(taken :+ _))
-              else F.pure(taken)
-            }
+            messages <- poll(room, Nil)
             _ <- inflight.update(_ ++ messages.map(_.getJMSMessageID))
           } yield messages.map(delivered(_, destination, consumerSettings))
         }
+
+      private def poll(room: Int, taken: List[JmsMessage]): F[List[JmsMessage]] =
+        if (taken.size >= room) F.pure(taken)
+        else
+          F.blocking(Option(reader.receive(settings.receiveTimeout.toMillis))).flatMap {
+            case Some(message) => poll(room, taken :+ message)
+            case None => F.pure(taken)
+          }
 
       private def delivered(
         message: JmsMessage,
@@ -163,7 +189,6 @@ private final class JmsBroker[F[_]](
       .continually(if (names.hasMoreElements) Some(names.nextElement().toString) else None)
       .takeWhile(_.isDefined)
       .flatten
-      .filterNot(name => name.startsWith("JMS") || name.startsWith("_"))
       .map(name => name -> message.getStringProperty(name))
       .filter { case (_, value) => value != null }
       .toMap
@@ -175,13 +200,12 @@ private final class JmsBroker[F[_]](
       case _ => Array.emptyByteArray
     }
     val attempt = properties.get(attemptProperty).flatMap(_.toIntOption).getOrElse(1)
+    val headers = properties.toList.flatMap { case (property, value) =>
+      headerOf(property).map(_ -> value)
+    }.toMap
     Envelope(
       MessageId(message.getJMSMessageID),
-      Message(
-        payload,
-        properties - attemptProperty - keyProperty,
-        properties.get(keyProperty).map(MessageKey.apply),
-      ),
+      Message(payload, headers, properties.get(keyProperty).map(MessageKey.apply)),
       attempt,
     )
   }
@@ -198,11 +222,14 @@ private final class JmsBroker[F[_]](
       F.blocking {
         val body = session.createBytesMessage()
         body.writeBytes(message.payload)
-        message.headers.foreach { case (name, value) => body.setStringProperty(name, value) }
+        message.headers.foreach { case (name, value) =>
+          body.setStringProperty(propertyOf(name), value)
+        }
         message.key.foreach(key => body.setStringProperty(keyProperty, key.value))
         body.setStringProperty(attemptProperty, attempt.toString)
         message.headers.get(priorityHeader).flatMap(_.toIntOption).foreach(sender.setPriority)
-        sender.setDeliveryDelay(delay.fold(0L)(_.toMillis.max(0L)))
+        if (settings.delaySupported)
+          sender.setDeliveryDelay(delay.fold(0L)(_.toMillis.max(0L)))
         sender.send(body)
         MessageId(body.getJMSMessageID)
       }

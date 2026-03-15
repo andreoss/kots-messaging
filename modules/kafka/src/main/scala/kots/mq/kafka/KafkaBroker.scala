@@ -95,6 +95,37 @@ private final class KafkaBroker[F[_]](
   val capabilities: Capabilities =
     Capabilities.of(Capability.Batch, Capability.DeadLetter, Capability.OrderingGroup)
 
+  val admin: Admin[F] = new Admin[F] {
+    def depth(destination: Destination): F[Option[Long]] =
+      Resource
+        .make(
+          F.blocking(
+            new KafkaConsumer[Array[Byte], Array[Byte]](
+              consumerProperties(settings, destination, ConsumerSettings.default)
+            )
+          )
+        )(reader => F.blocking(reader.close()))
+        .use { reader =>
+          F.blocking {
+            val partitions = Option(reader.partitionsFor(destination.name))
+              .map(_.asScala.toList)
+              .getOrElse(Nil)
+              .map(info => new TopicPartition(info.topic, info.partition))
+            if (partitions.isEmpty) None
+            else {
+              val ends = reader.endOffsets(partitions.asJava).asScala
+              val committed = reader.committed(partitions.toSet.asJava).asScala
+              Some(partitions.map { partition =>
+                val end = ends.get(partition).map(_.longValue).getOrElse(0L)
+                val position =
+                  committed.get(partition).flatMap(Option(_)).map(_.offset).getOrElse(0L)
+                math.max(0L, end - position)
+              }.sum)
+            }
+          }
+        }
+  }
+
   def producer(destination: Destination): Resource[F, Producer[F, Array[Byte]]] =
     Resource.pure(new Producer[F, Array[Byte]] {
 
@@ -139,13 +170,14 @@ private final class KafkaBroker[F[_]](
             room = math.max(0, math.min(max, consumerSettings.prefetch - held))
             records <- if (room <= 0) F.pure(List.empty[ConsumerRecord[Array[Byte], Array[Byte]]])
             else fetch(room)
-            _ <- records.traverse_(record =>
-              tracked.update(current =>
-                current.updated(
-                  partitionOf(record),
-                  current.getOrElse(partitionOf(record), Offsets.empty).taken(record.offset),
+            _ <- tracked.update(current =>
+              records.foldLeft(current) { (offsets, record) =>
+                val partition = partitionOf(record)
+                offsets.updated(
+                  partition,
+                  offsets.getOrElse(partition, Offsets.empty).taken(record.offset),
                 )
-              )
+              }
             )
           } yield records.map(delivered(_, destination, consumerSettings))
         }
