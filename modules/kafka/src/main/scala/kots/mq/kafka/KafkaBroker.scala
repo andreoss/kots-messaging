@@ -26,7 +26,7 @@ object KafkaBroker {
   ): Resource[F, Broker[F, Array[Byte]]] =
     Resource
       .make(F.blocking(new KafkaProducer[Array[Byte], Array[Byte]](producerProperties(settings))))(
-        client => F.blocking(client.close())
+        client => F.blocking(client.close(JavaDuration.ofSeconds(5)))
       )
       .map(new KafkaBroker[F](_, settings, entropy))
 
@@ -104,7 +104,7 @@ private final class KafkaBroker[F[_]](
               consumerProperties(settings, destination, ConsumerSettings.default)
             )
           )
-        )(reader => F.blocking(reader.close()))
+        )(reader => F.blocking(reader.close(JavaDuration.ofSeconds(5))))
         .use { reader =>
           F.blocking {
             val partitions = Option(reader.partitionsFor(destination.name))
@@ -151,7 +151,7 @@ private final class KafkaBroker[F[_]](
             consumerProperties(settings, destination, consumerSettings)
           )
         )
-      )(closing => F.blocking(closing.close()))
+      )(closing => F.blocking(closing.close(JavaDuration.ofSeconds(5))))
       _ <- Resource.eval(F.blocking(reader.subscribe(Collections.singletonList(destination.name))))
       guard <- Resource.eval(Mutex[F])
       buffered <- Resource.eval(
