@@ -7,5 +7,7 @@ trait Delivery[F[_], A] {
   def envelope: Envelope[A]
   def ack: F[Unit]
   def reject: F[Unit]
+  def release: F[Unit]
+  def deadLetter: F[Unit]
   def extend(by: FiniteDuration): F[Unit]
 }

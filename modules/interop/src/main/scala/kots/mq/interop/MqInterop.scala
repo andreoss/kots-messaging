@@ -59,6 +59,8 @@ object MqInterop {
       val envelope: Envelope[A] = delivery.envelope
       val ack: G[Unit] = fk(delivery.ack)
       val reject: G[Unit] = fk(delivery.reject)
+      val release: G[Unit] = fk(delivery.release)
+      val deadLetter: G[Unit] = fk(delivery.deadLetter)
       def extend(by: FiniteDuration): G[Unit] = fk(delivery.extend(by))
     }
 }

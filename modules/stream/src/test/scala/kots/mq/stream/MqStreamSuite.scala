@@ -118,3 +118,61 @@ final class MqStreamSuite extends CatsEffectSuite {
     }
   }
 }
+
+final class MqStreamSettleSuite extends CatsEffectSuite {
+
+  private val destination = Destination("settled-stream")
+
+  private val settings = ConsumerSettings.default.withBackoff(Backoff.none)
+
+  private def endpoints[A](
+    f: (Producer[IO, String], Consumer[IO, String]) => IO[A]
+  ): IO[A] =
+    MemBroker.create[IO, String](Entropy.const[IO](1.0)).flatMap { broker =>
+      (broker.producer(destination), broker.consumer(destination, settings)).tupled.use {
+        case (producer, consumer) => f(producer, consumer)
+      }
+    }
+
+  test("the stream settles each element the way its handler asked") {
+    endpoints { (producer, consumer) =>
+      for {
+        _ <- List("done", "release").traverse_(body => producer.send(Message.of(body)))
+        handled <- MqStream
+          .settle(consumer, 1, 1, 10.millis, _ => Settlement.Retry) { envelope =>
+            IO.pure(
+              if (envelope.message.payload == "done") Settlement.Done else Settlement.Release
+            )
+          }
+          .take(2)
+          .compile
+          .toList
+        remaining <- consumer.receiveBatch(10)
+        _ <- remaining.traverse_(_.ack)
+      } yield {
+        assertEquals(handled.map(_.message.payload), List("done", "release"))
+        assertEquals(remaining.map(_.envelope.message.payload), List("release"))
+        assertEquals(remaining.map(_.envelope.attempt), List(1))
+      }
+    }
+  }
+
+  test("a handler that fails settles by the stated default") {
+    endpoints { (producer, consumer) =>
+      for {
+        _ <- producer.send(Message.of("body"))
+        handled <- MqStream
+          .settle(consumer, 1, 1, 10.millis, _ => Settlement.Drop)(_ =>
+            IO.raiseError[Settlement](new RuntimeException("no"))
+          )
+          .take(1)
+          .compile
+          .toList
+        remaining <- consumer.receive
+      } yield {
+        assertEquals(handled.map(_.message.payload), List("body"))
+        assertEquals(remaining.map(_.envelope.attempt), None)
+      }
+    }
+  }
+}

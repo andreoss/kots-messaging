@@ -33,6 +33,16 @@ object MqStream {
       }.as(delivery.envelope)
     }
 
+  def settle[F[_], A](
+    consumer: Consumer[F, A],
+    concurrency: Int,
+    chunkSize: Int,
+    idle: FiniteDuration,
+    onError: Throwable => Settlement,
+  )(handle: Envelope[A] => F[Settlement])(implicit F: Temporal[F]): Stream[F, Envelope[A]] =
+    deliveries(consumer, chunkSize, idle)
+      .parEvalMap(concurrency)(Semantics.settleWith(_, onError)(handle))
+
   def sink[F[_], A](
     producer: Producer[F, A],
     batchSize: Int,

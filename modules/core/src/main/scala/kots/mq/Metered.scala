@@ -67,6 +67,10 @@ object Metered {
 
       val reject: F[Unit] = delivery.reject *> metrics.rejected
 
+      val release: F[Unit] = delivery.release
+
+      val deadLetter: F[Unit] = delivery.deadLetter
+
       def extend(by: FiniteDuration): F[Unit] = delivery.extend(by)
     }
 }

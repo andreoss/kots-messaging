@@ -213,6 +213,43 @@ abstract class QueueContract extends CatsEffectSuite {
     }
   }
 
+  test("a released delivery is received again") {
+    withEndpoints { (producer, consumer) =>
+      for {
+        _ <- producer.send(Message.of("body"))
+        first <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
+        _ <- first.traverse_(_.release)
+        again <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
+        _ <- again.traverse_(_.ack)
+      } yield {
+        assertEquals(first.map(_.envelope.message.payload), Some("body"))
+        assertEquals(again.map(_.envelope.message.payload), Some("body"))
+      }
+    }
+  }
+
+  test("a dead-lettered delivery leaves its destination for the parked one") {
+    whenDeclared(Capability.DeadLetter) { b =>
+      val source = fresh
+      val parked = fresh
+      val parking = settings.withDeadLetter(parked)
+      (b.producer(source), b.consumer(source, parking), b.consumer(parked, settings)).tupled.use {
+        case (producer, consumer, dead) =>
+          for {
+            _ <- producer.send(Message.of("poison"))
+            first <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
+            _ <- first.traverse_(_.deadLetter)
+            parkedMessage <- CapabilityChecks.receiveWithin(dead, 30.seconds)
+            _ <- parkedMessage.traverse_(_.ack)
+            stale <- consumer.receive
+          } yield {
+            assertEquals(parkedMessage.map(_.envelope.message.payload), Some("poison"))
+            assertEquals(stale.map(_.envelope.message.payload), None)
+          }
+      }
+    }
+  }
+
   test("a destination is isolated from its neighbour") {
     broker.use { b =>
       val left = fresh

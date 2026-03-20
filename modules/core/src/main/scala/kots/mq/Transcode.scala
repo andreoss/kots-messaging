@@ -63,6 +63,8 @@ object Transcode {
         Envelope(underlying.envelope.id, message, underlying.envelope.attempt)
       val ack: F[Unit] = underlying.ack
       val reject: F[Unit] = underlying.reject
+      val release: F[Unit] = underlying.release
+      val deadLetter: F[Unit] = underlying.deadLetter
       def extend(by: FiniteDuration): F[Unit] = underlying.extend(by)
     }
 }

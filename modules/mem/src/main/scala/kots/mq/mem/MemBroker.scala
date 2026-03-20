@@ -134,6 +134,30 @@ private final class MemBroker[F[_], A](
           }
         } yield ()
 
+      val release: F[Unit] =
+        F.monotonic.flatMap { now =>
+          state.update { current =>
+            held(current).fold(current)(lease =>
+              push(
+                current.copy(leased = current.leased - taken.id),
+                lease.destination,
+                Pending(lease.envelope, now),
+              )
+            )
+          }
+        }
+
+      val deadLetter: F[Unit] =
+        F.monotonic.flatMap { now =>
+          state.update { current =>
+            held(current).fold(current) { lease =>
+              val settled = current.copy(leased = current.leased - taken.id)
+              lease.settings.deadLetter
+                .fold(settled)(parked => push(settled, parked, Pending(lease.envelope, now)))
+            }
+          }
+        }
+
       def extend(by: FiniteDuration): F[Unit] =
         F.monotonic.flatMap { now =>
           state.update { current =>

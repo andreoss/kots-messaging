@@ -217,6 +217,16 @@ private final class AmqpBroker[F[_]](
                 )
               } yield ()
 
+          val release: F[Unit] =
+            guard.lock.surround(
+              F.blocking(channel.basicNack(tag, false, true)) *> inflight.update(_ - tag)
+            )
+
+          val deadLetter: F[Unit] =
+            guard.lock.surround(
+              F.blocking(channel.basicReject(tag, false)) *> inflight.update(_ - tag)
+            )
+
           def extend(by: FiniteDuration): F[Unit] =
             F.raiseError(CapabilityUnsupported(Capability.LeaseExtension))
         }

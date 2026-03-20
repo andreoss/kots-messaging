@@ -217,6 +217,14 @@ private final class KafkaBroker[F[_]](
               _ <- guard.lock.surround(commit(record))
             } yield ()
 
+          val release: F[Unit] =
+            guard.lock.surround(buffered.update(record +: _))
+
+          val deadLetter: F[Unit] =
+            consumerSettings.deadLetter.traverse_(parked =>
+              publish(parked, envelope.message, envelope.attempt)
+            ) *> guard.lock.surround(commit(record))
+
           def extend(by: FiniteDuration): F[Unit] =
             F.raiseError(CapabilityUnsupported(Capability.LeaseExtension))
         }

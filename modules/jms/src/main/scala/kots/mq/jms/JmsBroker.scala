@@ -166,6 +166,14 @@ private final class JmsBroker[F[_]](
               _ <- ack
             } yield ()
 
+          val release: F[Unit] =
+            republish(destination, envelope.message, envelope.attempt, None) *> ack
+
+          val deadLetter: F[Unit] =
+            consumerSettings.deadLetter.traverse_(parked =>
+              republish(parked, envelope.message, envelope.attempt, None)
+            ) *> ack
+
           def extend(by: FiniteDuration): F[Unit] =
             F.raiseError(CapabilityUnsupported(Capability.LeaseExtension))
         }

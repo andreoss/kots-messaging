@@ -178,6 +178,15 @@ private final class SqsBroker[F[_]](
                 _ <- inflight.update(_ - message.receiptHandle)
               } yield ()
 
+          val release: F[Unit] =
+            changeVisibility(url, message.receiptHandle, 0) *>
+              inflight.update(_ - message.receiptHandle)
+
+          val deadLetter: F[Unit] =
+            consumerSettings.deadLetter.traverse_(parked =>
+              queueUrl(parked).flatMap(parkedUrl => publish(parkedUrl, envelope.message, None))
+            ) *> ack
+
           def extend(by: FiniteDuration): F[Unit] =
             changeVisibility(url, message.receiptHandle, by.toSeconds.toInt)
         }

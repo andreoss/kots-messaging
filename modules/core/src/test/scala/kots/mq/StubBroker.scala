@@ -63,6 +63,9 @@ object StubBroker {
               state.update { case (queue, published) =>
                 (queue :+ taken.copy(attempt = taken.attempt + 1), published)
               }
+            val release: F[Unit] =
+              state.update { case (queue, published) => (queue :+ taken, published) }
+            val deadLetter: F[Unit] = F.unit
             def extend(by: FiniteDuration): F[Unit] = F.unit
           }
       }
