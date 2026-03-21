@@ -9,14 +9,16 @@ trait Producer[F[_], A] {
   def sendBatch(messages: List[Message[A]]): F[List[Either[SendFailure, MessageId]]]
 }
 
-/** Why one entry of a batch was not published; carries no payload. */
-final case class SendFailure(code: String, description: String)
+/** Why one entry was not published, and whether trying again could help. */
+final case class SendFailure(code: String, description: String, recoverable: Boolean)
 
 object SendFailure {
 
+  /** A failure this library cannot tell is transient. */
   def of(error: Throwable): SendFailure =
     SendFailure(
       error.getClass.getSimpleName,
       Option(error.getMessage).getOrElse(error.getClass.getName),
+      recoverable = false,
     )
 }

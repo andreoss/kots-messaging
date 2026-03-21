@@ -1,9 +1,17 @@
 package kots.mq.amqp
 
-import cats.effect.kernel.{Async, Resource}
-import cats.effect.std.Mutex
+import cats.effect.kernel.{Async, Deferred, Ref, Resource}
+import cats.effect.std.{Dispatcher, Mutex}
 import cats.syntax.all._
-import com.rabbitmq.client.{AMQP, Channel, Connection, ConnectionFactory, GetResponse, ReturnListener}
+import com.rabbitmq.client.{
+  AMQP,
+  Channel,
+  ConfirmListener,
+  Connection,
+  ConnectionFactory,
+  GetResponse,
+  ReturnListener,
+}
 import kots.mq._
 
 import java.util.concurrent.atomic.AtomicReference
@@ -59,13 +67,44 @@ private final class AmqpBroker[F[_]](
   private def channelResource: Resource[F, Channel] =
     Resource.make(F.blocking(connection.createChannel()))(channel => F.blocking(channel.close()))
 
-  def producer(destination: Destination): Resource[F, Producer[F, Array[Byte]]] =
+  private final class Confirming(
+    val channel: Channel,
+    val guard: Mutex[F],
+    val returned: AtomicReference[Option[String]],
+    val pending: Ref[F, Map[Long, Deferred[F, Either[String, Unit]]]],
+  ) {
+
+    def settle(tag: Long, multiple: Boolean, outcome: Either[String, Unit]): F[Unit] =
+      pending
+        .modify { current =>
+          val (settled, rest) = current.partition { case (sequence, _) =>
+            if (multiple) sequence <= tag else sequence == tag
+          }
+          (rest, settled.values.toList)
+        }
+        .flatMap(_.traverse_(_.complete(outcome).void))
+  }
+
+  /** A channel whose publishes are confirmed by the broker as they land. */
+  private def confirming(channel: Channel): Resource[F, Confirming] =
     for {
-      channel <- channelResource
       _ <- Resource.eval(F.blocking(channel.confirmSelect()))
+      dispatcher <- Dispatcher.parallel[F](await = false)
+      guard <- Resource.eval(Mutex[F])
       returned <- Resource.eval(F.delay(new AtomicReference[Option[String]](None)))
+      pending <- Resource.eval(F.ref(Map.empty[Long, Deferred[F, Either[String, Unit]]]))
+      publisher = new Confirming(channel, guard, returned, pending)
       _ <- Resource.eval(
-        F.blocking(
+        F.blocking {
+          channel.addConfirmListener(new ConfirmListener {
+            def handleAck(tag: Long, multiple: Boolean): Unit =
+              dispatcher.unsafeRunAndForget(publisher.settle(tag, multiple, Right(())))
+
+            def handleNack(tag: Long, multiple: Boolean): Unit =
+              dispatcher.unsafeRunAndForget(
+                publisher.settle(tag, multiple, Left("the broker refused the publish"))
+              )
+          })
           channel.addReturnListener(new ReturnListener {
             def handleReturn(
               replyCode: Int,
@@ -76,14 +115,19 @@ private final class AmqpBroker[F[_]](
               body: Array[Byte],
             ): Unit = returned.set(Some(s"unroutable: $replyText"))
           })
-        )
+        }
       )
-      guard <- Resource.eval(Mutex[F])
+    } yield publisher
+
+  def producer(destination: Destination): Resource[F, Producer[F, Array[Byte]]] =
+    for {
+      channel <- channelResource
+      publisher <- confirming(channel)
       declared <- Resource.eval(F.ref(Set.empty[String]))
     } yield new Producer[F, Array[Byte]] {
 
       def send(message: Message[Array[Byte]]): F[MessageId] =
-        publish(channel, guard, returned, destination.name, message, 1, None)
+        publish(publisher, destination.name, message, 1, None)
 
       def sendBatch(
         messages: List[Message[Array[Byte]]]
@@ -110,15 +154,7 @@ private final class AmqpBroker[F[_]](
             .void
             .unlessA(known.contains(holding))
           _ <- declared.update(_ + holding)
-          id <- publish(
-            channel,
-            guard,
-            returned,
-            holding,
-            message,
-            1,
-            Some(delay.toMillis.max(0L).toString),
-          )
+          id <- publish(publisher, holding, message, 1, Some(delay.toMillis.max(0L).toString))
         } yield id
       }
     }
@@ -129,10 +165,8 @@ private final class AmqpBroker[F[_]](
   ): Resource[F, Consumer[F, Array[Byte]]] =
     for {
       channel <- channelResource
-      _ <- Resource.eval(F.blocking(channel.confirmSelect()))
-      _ <- Resource.eval(
-        F.blocking(channel.basicQos(consumerSettings.prefetch))
-      )
+      publisher <- confirming(channel)
+      _ <- Resource.eval(F.blocking(channel.basicQos(consumerSettings.prefetch)))
       _ <- Resource.eval(
         consumerSettings.deadLetter.traverse_(parked =>
           F.blocking(
@@ -157,10 +191,10 @@ private final class AmqpBroker[F[_]](
           )
         ).void
       )
-      guard <- Resource.eval(Mutex[F])
-      returned <- Resource.eval(F.delay(new AtomicReference[Option[String]](None)))
       inflight <- Resource.eval(F.ref(Set.empty[Long]))
     } yield new Consumer[F, Array[Byte]] {
+
+      private val guard: Mutex[F] = publisher.guard
 
       def receive: F[Option[Delivery[F, Array[Byte]]]] = receiveBatch(1).map(_.headOption)
 
@@ -209,15 +243,7 @@ private final class AmqpBroker[F[_]](
               for {
                 sample <- entropy.nextDouble
                 _ <- F.sleep(consumerSettings.backoff.delay(envelope.attempt, sample))
-                _ <- publish(
-                  channel,
-                  guard,
-                  returned,
-                  destination.name,
-                  envelope.message,
-                  envelope.attempt + 1,
-                  None,
-                )
+                _ <- publish(publisher, destination.name, envelope.message, envelope.attempt + 1, None)
                 _ <- guard.lock.surround(
                   F.blocking(channel.basicAck(tag, false)) *> inflight.update(_ - tag)
                 )
@@ -271,9 +297,7 @@ private final class AmqpBroker[F[_]](
     }
 
   private def publish(
-    channel: Channel,
-    guard: Mutex[F],
-    returned: AtomicReference[Option[String]],
+    publisher: Confirming,
     routingKey: String,
     message: Message[Array[Byte]],
     attempt: Int,
@@ -286,19 +310,33 @@ private final class AmqpBroker[F[_]](
           (attemptHeader -> (attempt.toString: AnyRef))
       val builder = new AMQP.BasicProperties.Builder().messageId(id).headers(headers.asJava)
       val properties = expiration.fold(builder)(builder.expiration).build()
-      guard.lock.surround(
+
+      val send: F[Deferred[F, Either[String, Unit]]] =
+        F.deferred[Either[String, Unit]].flatTap { confirmation =>
+          for {
+            _ <- F.delay(publisher.returned.set(None))
+            sequence <- F.blocking(publisher.channel.getNextPublishSeqNo)
+            _ <- publisher.pending.update(_ + (sequence -> confirmation))
+            _ <- F.blocking(
+              publisher.channel
+                .basicPublish("", routingKey, settings.mandatory, properties, message.payload)
+            )
+          } yield ()
+        }
+
+      val awaited: F[MessageId] =
         for {
-          _ <- F.delay(returned.set(None))
-          _ <- F.blocking(
-            channel.basicPublish("", routingKey, settings.mandatory, properties, message.payload)
+          confirmation <- if (settings.mandatory) send else publisher.guard.lock.surround(send)
+          outcome <- F.timeoutTo(
+            confirmation.get,
+            settings.confirmTimeout,
+            F.pure(Left("the broker did not confirm the publish"): Either[String, Unit]),
           )
-          confirmed <- F.blocking(channel.waitForConfirms(settings.confirmTimeout.toMillis))
-          _ <- F
-            .raiseError[Unit](AmqpPublishFailed("the broker did not confirm the publish"))
-            .unlessA(confirmed)
-          failure <- unroutable(returned)
+          _ <- outcome.fold(reason => F.raiseError[Unit](AmqpPublishFailed(reason)), _ => F.unit)
+          failure <- unroutable(publisher.returned)
           _ <- failure.traverse_(reason => F.raiseError[Unit](AmqpPublishFailed(reason)))
         } yield MessageId(id)
-      )
+
+      if (settings.mandatory) publisher.guard.lock.surround(awaited) else awaited
     }
 }

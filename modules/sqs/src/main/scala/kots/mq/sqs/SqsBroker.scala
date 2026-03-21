@@ -37,6 +37,9 @@ object SqsBroker {
 
   private[sqs] val keyAttribute = "x-mq-key"
 
+  private[sqs] val recoverableCodes: Set[String] =
+    Set("ServiceUnavailable", "ThrottlingException", "RequestThrottled", "InternalError")
+
   def bytes[F[_]](settings: SqsSettings, entropy: Entropy[F])(implicit
     F: Async[F]
   ): Resource[F, Broker[F, Array[Byte]]] =
@@ -381,7 +384,13 @@ private final class SqsBroker[F[_]](
         val failed = response
           .failed()
           .asScala
-          .map(entry => entry.id -> SendFailure(entry.code, entry.message))
+          .map(entry =>
+            entry.id -> SendFailure(
+              entry.code,
+              entry.message,
+              recoverable = !entry.senderFault || recoverableCodes(entry.code),
+            )
+          )
           .toMap
         messages.indices.toList.map { index =>
           val id = index.toString
@@ -389,7 +398,9 @@ private final class SqsBroker[F[_]](
             .get(id)
             .map(Right(_))
             .orElse(failed.get(id).map(Left(_)))
-            .getOrElse(Left(SendFailure("Unknown", "the service reported no outcome")))
+            .getOrElse(
+              Left(SendFailure("Unknown", "the service reported no outcome", recoverable = false))
+            )
         }
       }
     }

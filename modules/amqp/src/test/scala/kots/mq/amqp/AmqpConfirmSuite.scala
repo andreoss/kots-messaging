@@ -38,3 +38,60 @@ final class AmqpConfirmSuite extends CatsEffectSuite {
     }
   }
 }
+
+final class AmqpPipelineSuite extends CatsEffectSuite {
+
+  override def munitIOTimeout: Duration = 180.seconds
+
+  private val bodies = List.range(0, 20).map(index => Message.of(s"body-$index"))
+
+  test("confirms overlap: twenty publishes cost far less than twenty round trips") {
+    val destination = AmqpTestSupport.queue("pipelined")
+    AmqpTestSupport.broker().use { broker =>
+      (
+        broker.consumer(destination, AmqpTestSupport.settingsWithoutBackoff.withPrefetch(64)),
+        broker.producer(destination),
+      ).tupled.use { case (consumer, producer) =>
+        for {
+          _ <- producer.send(Message.of("warm"))
+          sequential <- IO.monotonic.flatMap(start =>
+            bodies.traverse(producer.send) *> IO.monotonic.map(_ - start)
+          )
+          pipelined <- IO.monotonic.flatMap(start =>
+            bodies.parTraverse(producer.send) *> IO.monotonic.map(_ - start)
+          )
+          depth <- broker.admin.depth(destination)
+          received <- CapabilityChecks.batchWithin(consumer, bodies.size * 2 + 1, 60.seconds)
+          _ <- consumer.ackAll(received)
+        } yield {
+          assertEquals(depth, Some((bodies.size * 2 + 1).toLong))
+          assertEquals(received.size, bodies.size * 2 + 1)
+          assert(
+            pipelined * 3 < sequential * 2,
+            s"pipelined $pipelined against sequential $sequential",
+          )
+        }
+      }
+    }
+  }
+
+  test("a publish is confirmed before its identity is returned") {
+    val destination = AmqpTestSupport.queue("confirmed-order")
+    AmqpTestSupport.broker().use { broker =>
+      (
+        broker.consumer(destination, AmqpTestSupport.settingsWithoutBackoff.withPrefetch(32)),
+        broker.producer(destination),
+      ).tupled.use { case (consumer, producer) =>
+        for {
+          ids <- bodies.traverse(producer.send)
+          depth <- broker.admin.depth(destination)
+          received <- CapabilityChecks.batchWithin(consumer, bodies.size, 60.seconds)
+          _ <- consumer.ackAll(received)
+        } yield {
+          assertEquals(ids.distinct.size, bodies.size)
+          assertEquals(depth, Some(bodies.size.toLong))
+        }
+      }
+    }
+  }
+}
