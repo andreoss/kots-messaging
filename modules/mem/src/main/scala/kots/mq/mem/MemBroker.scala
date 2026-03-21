@@ -101,6 +101,12 @@ private final class MemBroker[F[_], A](
               sample <- entropy.nextDouble
               taken <- state.modify(take(_, destination, settings, holder, now, sample, max))
             } yield taken.map { case (envelope, token) => delivery(envelope, token) }
+
+          def ackAll(deliveries: List[Delivery[F, A]]): F[Unit] =
+            deliveries.traverse_(_.ack)
+
+          def extendAll(deliveries: List[Delivery[F, A]], by: FiniteDuration): F[Unit] =
+            deliveries.traverse_(_.extend(by))
         }
       )
 

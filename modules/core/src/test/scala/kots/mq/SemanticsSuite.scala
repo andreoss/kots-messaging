@@ -87,7 +87,7 @@ final class SettlementSuite extends CatsEffectSuite {
     endpoints { (producer, consumer) =>
       for {
         _ <- producer.send(Message.of("body"))
-        _ <- Semantics.process(consumer, _ => Settlement.Retry)(_ => IO.pure(outcome))
+        _ <- Semantics.process(consumer, Handling.default)(_ => IO.pure(outcome))
         next <- consumer.receive
         _ <- f(consumer, next)
       } yield ()
@@ -120,7 +120,7 @@ final class SettlementSuite extends CatsEffectSuite {
       for {
         _ <- producer.send(Message.of("body"))
         outcome <- Semantics
-          .process(consumer, _ => Settlement.Drop)(_ => IO.raiseError[Settlement](new RuntimeException("no")))
+          .process(consumer, Handling.default.onErrorSettle(Settlement.Drop))(_ => IO.raiseError[Settlement](new RuntimeException("no")))
           .attempt
         next <- consumer.receive
       } yield {
@@ -135,7 +135,7 @@ final class SettlementSuite extends CatsEffectSuite {
       for {
         _ <- producer.send(Message.of("body"))
         _ <- Semantics
-          .process(consumer, _ => Settlement.Retry)(_ => IO.raiseError[Settlement](new RuntimeException("no")))
+          .process(consumer, Handling.default)(_ => IO.raiseError[Settlement](new RuntimeException("no")))
         next <- consumer.receive
       } yield assertEquals(next.map(_.envelope.attempt), Some(2))
     }
@@ -146,7 +146,7 @@ final class SettlementSuite extends CatsEffectSuite {
       for {
         _ <- producer.send(Message.of("body"))
         fiber <- Semantics
-          .process(consumer, _ => Settlement.Retry)(_ => IO.canceled *> IO.pure(Settlement.Done))
+          .process(consumer, Handling.default)(_ => IO.canceled *> IO.pure(Settlement.Done))
           .start
         outcome <- fiber.join
         next <- consumer.receive
@@ -160,7 +160,7 @@ final class SettlementSuite extends CatsEffectSuite {
   test("processing a drained destination handles nothing") {
     endpoints { (_, consumer) =>
       Semantics
-        .process(consumer, _ => Settlement.Retry)(_ => IO.pure(Settlement.Done))
+        .process(consumer, Handling.default)(_ => IO.pure(Settlement.Done))
         .map(handledEnvelope => assertEquals(handledEnvelope.map(_.message.payload), None))
     }
   }

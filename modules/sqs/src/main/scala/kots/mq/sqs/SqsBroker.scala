@@ -7,8 +7,12 @@ import software.amazon.awssdk.auth.credentials.{AwsBasicCredentials, StaticCrede
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.sqs.SqsClient
 import software.amazon.awssdk.services.sqs.model.{
+  ChangeMessageVisibilityBatchRequest,
+  ChangeMessageVisibilityBatchRequestEntry,
   ChangeMessageVisibilityRequest,
   CreateQueueRequest,
+  DeleteMessageBatchRequest,
+  DeleteMessageBatchRequestEntry,
   DeleteMessageRequest,
   GetQueueAttributesRequest,
   GetQueueUrlRequest,
@@ -36,6 +40,14 @@ object SqsBroker {
   def bytes[F[_]](settings: SqsSettings, entropy: Entropy[F])(implicit
     F: Async[F]
   ): Resource[F, Broker[F, Array[Byte]]] =
+    client(settings).map(fromClient(_, settings, entropy))
+
+  /** Over a client the caller built and owns. */
+  def fromClient[F[_]](client: SqsClient, settings: SqsSettings, entropy: Entropy[F])(implicit
+    F: Async[F]
+  ): Broker[F, Array[Byte]] = new SqsBroker[F](client, settings, entropy)
+
+  private def client[F[_]](settings: SqsSettings)(implicit F: Async[F]): Resource[F, SqsClient] =
     Resource
       .make(F.blocking {
         val builder = SqsClient
@@ -47,8 +59,7 @@ object SqsBroker {
             )
           )
         settings.endpoint.fold(builder)(uri => builder.endpointOverride(URI.create(uri))).build()
-      })(client => F.blocking(client.close()))
-      .map(new SqsBroker[F](_, settings, entropy))
+      })(open => F.blocking(open.close()))
 }
 
 private final class SqsBroker[F[_]](
@@ -144,54 +155,99 @@ private final class SqsBroker[F[_]](
                   .toList
               )
           _ <- inflight.update(_ ++ messages.map(_.receiptHandle))
-        } yield messages.map(delivered(url, _, consumerSettings, inflight))
+        } yield messages.map(new QueuedDelivery(_))
 
-      private def delivered(
-        url: String,
-        message: SqsMessage,
-        consumerSettings: ConsumerSettings,
-        inflight: cats.effect.kernel.Ref[F, Set[String]],
-      ): Delivery[F, Array[Byte]] =
-        new Delivery[F, Array[Byte]] {
+      def ackAll(deliveries: List[Delivery[F, Array[Byte]]]): F[Unit] = {
+        val handles = deliveries.collect { case delivery: QueuedDelivery => delivery.handle }
+        val others = deliveries.filterNot(_.isInstanceOf[QueuedDelivery])
+        deleteBatch(handles) *> others.traverse_(_.ack)
+      }
 
-          val envelope: Envelope[Array[Byte]] = envelopeOf(message)
+      def extendAll(deliveries: List[Delivery[F, Array[Byte]]], by: FiniteDuration): F[Unit] = {
+        val handles = deliveries.collect { case delivery: QueuedDelivery => delivery.handle }
+        val others = deliveries.filterNot(_.isInstanceOf[QueuedDelivery])
+        visibilityBatch(handles, by.toSeconds.toInt) *> others.traverse_(_.extend(by))
+      }
 
-          val ack: F[Unit] =
-            F.blocking(
-              client.deleteMessage(
-                DeleteMessageRequest
-                  .builder()
-                  .queueUrl(url)
-                  .receiptHandle(message.receiptHandle)
-                  .build()
-              )
-            ).void *> inflight.update(_ - message.receiptHandle)
-
-          val reject: F[Unit] =
-            if (envelope.attempt >= consumerSettings.maxAttempts && consumerSettings.deadLetter.isEmpty)
-              ack
-            else
-              for {
-                sample <- entropy.nextDouble
-                seconds = consumerSettings.backoff.delay(envelope.attempt, sample).toSeconds.toInt
-                _ <- changeVisibility(url, message.receiptHandle, seconds)
-                _ <- inflight.update(_ - message.receiptHandle)
-              } yield ()
-
-          val release: F[Unit] =
-            changeVisibility(url, message.receiptHandle, 0) *>
-              inflight.update(_ - message.receiptHandle)
-
-          val deadLetter: F[Unit] =
-            consumerSettings.deadLetter.traverse_(parked =>
-              queueUrl(parked).flatMap(parkedUrl => publish(parkedUrl, envelope.message, None))
-            ) *> ack
-
-          def extend(by: FiniteDuration): F[Unit] =
-            changeVisibility(url, message.receiptHandle, by.toSeconds.toInt)
+      private def deleteBatch(handles: List[String]): F[Unit] =
+        handles.grouped(10).toList.traverse_ { batch =>
+          F.blocking(
+            client.deleteMessageBatch(
+              DeleteMessageBatchRequest
+                .builder()
+                .queueUrl(url)
+                .entries(
+                  batch.zipWithIndex.map { case (handle, index) =>
+                    DeleteMessageBatchRequestEntry
+                      .builder()
+                      .id(index.toString)
+                      .receiptHandle(handle)
+                      .build()
+                  }.asJava
+                )
+                .build()
+            )
+          ) *> inflight.update(_ -- batch)
         }
-    }
 
+      private def visibilityBatch(handles: List[String], seconds: Int): F[Unit] =
+        handles.grouped(10).toList.traverse_ { batch =>
+          F.blocking(
+            client.changeMessageVisibilityBatch(
+              ChangeMessageVisibilityBatchRequest
+                .builder()
+                .queueUrl(url)
+                .entries(
+                  batch.zipWithIndex.map { case (handle, index) =>
+                    ChangeMessageVisibilityBatchRequestEntry
+                      .builder()
+                      .id(index.toString)
+                      .receiptHandle(handle)
+                      .visibilityTimeout(seconds)
+                      .build()
+                  }.asJava
+                )
+                .build()
+            )
+          ).void
+        }
+
+      private final class QueuedDelivery(message: SqsMessage) extends Delivery[F, Array[Byte]] {
+
+        val handle: String = message.receiptHandle
+
+        val envelope: Envelope[Array[Byte]] = envelopeOf(message)
+
+        val ack: F[Unit] =
+          F.blocking(
+            client.deleteMessage(
+              DeleteMessageRequest.builder().queueUrl(url).receiptHandle(handle).build()
+            )
+          ).void *> inflight.update(_ - handle)
+
+        val reject: F[Unit] =
+          if (envelope.attempt >= consumerSettings.maxAttempts && consumerSettings.deadLetter.isEmpty)
+            ack
+          else
+            for {
+              sample <- entropy.nextDouble
+              seconds = consumerSettings.backoff.delay(envelope.attempt, sample).toSeconds.toInt
+              _ <- changeVisibility(url, handle, seconds)
+              _ <- inflight.update(_ - handle)
+            } yield ()
+
+        val release: F[Unit] =
+          changeVisibility(url, handle, 0) *> inflight.update(_ - handle)
+
+        val deadLetter: F[Unit] =
+          consumerSettings.deadLetter.traverse_(parked =>
+            queueUrl(parked).flatMap(parkedUrl => publish(parkedUrl, envelope.message, None))
+          ) *> ack
+
+        def extend(by: FiniteDuration): F[Unit] =
+          changeVisibility(url, handle, by.toSeconds.toInt)
+      }
+    }
   private def changeVisibility(url: String, handle: String, seconds: Int): F[Unit] =
     F.blocking(
       client.changeMessageVisibility(

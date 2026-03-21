@@ -44,7 +44,7 @@ object MqInterop {
     }
 
   def consumerK[F[_], G[_], A](consumer: Consumer[F, A])(fk: F ~> G)(implicit
-    G: cats.Functor[G]
+    G: cats.Applicative[G]
   ): Consumer[G, A] =
     new Consumer[G, A] {
       def receive: G[Option[Delivery[G, A]]] =
@@ -52,6 +52,12 @@ object MqInterop {
 
       def receiveBatch(max: Int): G[List[Delivery[G, A]]] =
         fk(consumer.receiveBatch(max)).map(_.map(deliveryK(_)(fk)))
+
+      def ackAll(deliveries: List[Delivery[G, A]]): G[Unit] =
+        deliveries.traverse_(_.ack)
+
+      def extendAll(deliveries: List[Delivery[G, A]], by: FiniteDuration): G[Unit] =
+        deliveries.traverse_(_.extend(by))
     }
 
   def deliveryK[F[_], G[_], A](delivery: Delivery[F, A])(fk: F ~> G): Delivery[G, A] =

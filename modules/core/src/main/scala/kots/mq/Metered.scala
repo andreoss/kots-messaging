@@ -42,6 +42,11 @@ object Metered {
       def receiveBatch(max: Int): F[List[Delivery[F, A]]] =
         measured(underlying.receiveBatch(max))
 
+      def ackAll(deliveries: List[Delivery[F, A]]): F[Unit] = deliveries.traverse_(_.ack)
+
+      def extendAll(deliveries: List[Delivery[F, A]], by: FiniteDuration): F[Unit] =
+        deliveries.traverse_(_.extend(by))
+
       private def measured(read: F[List[Delivery[F, A]]]): F[List[Delivery[F, A]]] =
         clock.timed(read).flatMap { case (elapsed, deliveries) =>
           metrics.receiveLatency(elapsed) *>

@@ -179,8 +179,17 @@ private final class KafkaBroker[F[_]](
                 )
               }
             )
-          } yield records.map(delivered(_, destination, consumerSettings))
+          } yield records.map(new RecordDelivery(_))
         }
+
+      def ackAll(deliveries: List[Delivery[F, Array[Byte]]]): F[Unit] = {
+        val records = deliveries.collect { case delivery: RecordDelivery => delivery.record }
+        val others = deliveries.filterNot(_.isInstanceOf[RecordDelivery])
+        guard.lock.surround(commit(records)) *> others.traverse_(_.ack)
+      }
+
+      def extendAll(deliveries: List[Delivery[F, Array[Byte]]], by: FiniteDuration): F[Unit] =
+        F.raiseError(CapabilityUnsupported(Capability.LeaseExtension))
 
       private def fetch(room: Int): F[List[ConsumerRecord[Array[Byte], Array[Byte]]]] =
         for {
@@ -192,66 +201,66 @@ private final class KafkaBroker[F[_]](
         F.blocking(reader.poll(JavaDuration.ofMillis(settings.pollTimeout.toMillis)))
           .flatMap(records => buffered.update(_ ++ records.asScala.toVector))
 
-      private def delivered(
-        record: ConsumerRecord[Array[Byte], Array[Byte]],
-        destination: Destination,
-        consumerSettings: ConsumerSettings,
-      ): Delivery[F, Array[Byte]] =
-        new Delivery[F, Array[Byte]] {
+      private final class RecordDelivery(
+        val record: ConsumerRecord[Array[Byte], Array[Byte]]
+      ) extends Delivery[F, Array[Byte]] {
 
-          val envelope: Envelope[Array[Byte]] = envelopeOf(record)
+        val envelope: Envelope[Array[Byte]] = envelopeOf(record)
 
-          val ack: F[Unit] = guard.lock.surround(commit(record))
+        val ack: F[Unit] = guard.lock.surround(commit(List(record)))
 
-          val reject: F[Unit] =
-            for {
-              sample <- entropy.nextDouble
-              _ <-
-                if (envelope.attempt >= consumerSettings.maxAttempts)
-                  consumerSettings.deadLetter.traverse_(parked =>
-                    publish(parked, envelope.message, envelope.attempt)
-                  )
-                else
-                  F.sleep(consumerSettings.backoff.delay(envelope.attempt, sample)) *>
-                    publish(destination, envelope.message, envelope.attempt + 1).void
-              _ <- guard.lock.surround(commit(record))
-            } yield ()
+        val reject: F[Unit] =
+          for {
+            sample <- entropy.nextDouble
+            _ <-
+              if (envelope.attempt >= consumerSettings.maxAttempts)
+                consumerSettings.deadLetter.traverse_(parked =>
+                  publish(parked, envelope.message, envelope.attempt)
+                )
+              else
+                F.sleep(consumerSettings.backoff.delay(envelope.attempt, sample)) *>
+                  publish(destination, envelope.message, envelope.attempt + 1).void
+            _ <- guard.lock.surround(commit(List(record)))
+          } yield ()
 
-          val release: F[Unit] =
-            guard.lock.surround(buffered.update(record +: _))
+        val release: F[Unit] = guard.lock.surround(buffered.update(record +: _))
 
-          val deadLetter: F[Unit] =
-            consumerSettings.deadLetter.traverse_(parked =>
-              publish(parked, envelope.message, envelope.attempt)
-            ) *> guard.lock.surround(commit(record))
+        val deadLetter: F[Unit] =
+          consumerSettings.deadLetter.traverse_(parked =>
+            publish(parked, envelope.message, envelope.attempt)
+          ) *> guard.lock.surround(commit(List(record)))
 
-          def extend(by: FiniteDuration): F[Unit] =
-            F.raiseError(CapabilityUnsupported(Capability.LeaseExtension))
-        }
+        def extend(by: FiniteDuration): F[Unit] =
+          F.raiseError(CapabilityUnsupported(Capability.LeaseExtension))
+      }
 
-      private def commit(record: ConsumerRecord[Array[Byte], Array[Byte]]): F[Unit] =
-        for {
-          offsets <- tracked.updateAndGet { current =>
-            val partition = partitionOf(record)
-            current.updated(
-              partition,
-              current.getOrElse(partition, Offsets.empty).settle(record.offset),
+      private def commit(records: List[ConsumerRecord[Array[Byte], Array[Byte]]]): F[Unit] =
+        if (records.isEmpty) F.unit
+        else
+          for {
+            offsets <- tracked.updateAndGet(current =>
+              records.foldLeft(current) { (acc, record) =>
+                val partition = partitionOf(record)
+                acc.updated(partition, acc.getOrElse(partition, Offsets.empty).settle(record.offset))
+              }
             )
-          }
-          partition = partitionOf(record)
-          _ <- offsets
-            .get(partition)
-            .flatMap(_.position)
-            .traverse_(position =>
-              F.blocking(
+            positions = records
+              .map(partitionOf)
+              .distinct
+              .flatMap(partition =>
+                offsets.get(partition).flatMap(_.position).map(partition -> _)
+              )
+            _ <- F
+              .blocking(
                 reader.commitSync(
-                  Collections.singletonMap(partition, new OffsetAndMetadata(position))
+                  positions.map { case (partition, position) =>
+                    partition -> new OffsetAndMetadata(position)
+                  }.toMap.asJava
                 )
               )
-            )
-        } yield ()
+              .whenA(positions.nonEmpty)
+          } yield ()
     }
-
   private def partitionOf(record: ConsumerRecord[Array[Byte], Array[Byte]]): TopicPartition =
     new TopicPartition(record.topic, record.partition)
 

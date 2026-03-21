@@ -128,6 +128,12 @@ private final class JmsBroker[F[_]](
           } yield messages.map(delivered(_, destination, consumerSettings))
         }
 
+      def ackAll(deliveries: List[Delivery[F, Array[Byte]]]): F[Unit] =
+        deliveries.traverse_(_.ack)
+
+      def extendAll(deliveries: List[Delivery[F, Array[Byte]]], by: FiniteDuration): F[Unit] =
+        F.raiseError(CapabilityUnsupported(Capability.LeaseExtension))
+
       private def poll(room: Int, taken: List[JmsMessage]): F[List[JmsMessage]] =
         if (taken.size >= room) F.pure(taken)
         else

@@ -53,6 +53,12 @@ object StubBroker {
                   ((queue.drop(taken.size), published), taken.toList)
                 }
                 .map(_.map(delivery))
+
+            def ackAll(deliveries: List[Delivery[F, A]]): F[Unit] =
+              deliveries.traverse_(_.ack)
+
+            def extendAll(deliveries: List[Delivery[F, A]], by: FiniteDuration): F[Unit] =
+              deliveries.traverse_(_.extend(by))
           })
 
         private def delivery(taken: Envelope[A]): Delivery[F, A] =

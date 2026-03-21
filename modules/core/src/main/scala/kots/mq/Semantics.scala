@@ -1,7 +1,7 @@
 package kots.mq
 
 import cats.{Applicative, Monad}
-import cats.effect.kernel.{MonadCancelThrow, Outcome}
+import cats.effect.kernel.{MonadCancelThrow, Outcome, Temporal}
 import cats.syntax.all._
 
 import scala.concurrent.duration.FiniteDuration
@@ -16,6 +16,11 @@ object Semantics {
 
       def receiveBatch(max: Int): F[List[Delivery[F, A]]] =
         consumer.receiveBatch(max).flatMap(_.traverse(settle))
+
+      def ackAll(deliveries: List[Delivery[F, A]]): F[Unit] = deliveries.traverse_(_.ack)
+
+      def extendAll(deliveries: List[Delivery[F, A]], by: FiniteDuration): F[Unit] =
+        deliveries.traverse_(_.extend(by))
 
       private def settle(delivery: Delivery[F, A]): F[Delivery[F, A]] =
         delivery.ack.as(alreadySettled(delivery))
@@ -34,20 +39,28 @@ object Semantics {
     })
 
   /** Runs the handler and settles the delivery the way the handler asked. */
-  def process[F[_], A](consumer: Consumer[F, A], onError: Throwable => Settlement)(
+  def process[F[_], A](consumer: Consumer[F, A], handling: Handling)(
     handle: Envelope[A] => F[Settlement]
-  )(implicit F: MonadCancelThrow[F]): F[Option[Envelope[A]]] =
-    consumer.receive.flatMap(_.traverse(settleWith(_, onError)(handle)))
+  )(implicit F: Temporal[F]): F[Option[Envelope[A]]] =
+    consumer.receive.flatMap(_.traverse(settleWith(_, handling)(handle)))
 
   /** One delivery through a handler, settled by its outcome. */
-  def settleWith[F[_], A](delivery: Delivery[F, A], onError: Throwable => Settlement)(
+  def settleWith[F[_], A](delivery: Delivery[F, A], handling: Handling)(
     handle: Envelope[A] => F[Settlement]
-  )(implicit F: MonadCancelThrow[F]): F[Envelope[A]] =
-    F.guaranteeCase(handle(delivery.envelope).handleError(onError)) {
+  )(implicit F: Temporal[F]): F[Envelope[A]] = {
+    val work = handle(delivery.envelope).handleError(handling.onError)
+    val bounded =
+      handling.timeout.fold(work)(limit => F.timeoutTo(work, limit, F.pure(handling.onTimeout)))
+    val renewed = handling.renewEvery.fold(bounded) { interval =>
+      val renewal = (F.sleep(interval) *> delivery.extend(interval * 2)).foreverM[Unit]
+      F.background(renewal).use(_ => bounded)
+    }
+    F.guaranteeCase(renewed) {
       case Outcome.Succeeded(_) => F.unit
       case Outcome.Canceled() => delivery.release
       case Outcome.Errored(_) => delivery.reject
     }.flatMap(settle(delivery, _)).as(delivery.envelope)
+  }
 
   private def settle[F[_], A](delivery: Delivery[F, A], settlement: Settlement): F[Unit] =
     settlement match {

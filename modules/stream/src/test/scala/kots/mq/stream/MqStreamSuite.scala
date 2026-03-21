@@ -139,7 +139,7 @@ final class MqStreamSettleSuite extends CatsEffectSuite {
       for {
         _ <- List("done", "release").traverse_(body => producer.send(Message.of(body)))
         handled <- MqStream
-          .settle(consumer, 1, 1, 10.millis, _ => Settlement.Retry) { envelope =>
+          .settle(consumer, 1, 1, 10.millis, Handling.default) { envelope =>
             IO.pure(
               if (envelope.message.payload == "done") Settlement.Done else Settlement.Release
             )
@@ -162,7 +162,7 @@ final class MqStreamSettleSuite extends CatsEffectSuite {
       for {
         _ <- producer.send(Message.of("body"))
         handled <- MqStream
-          .settle(consumer, 1, 1, 10.millis, _ => Settlement.Drop)(_ =>
+          .settle(consumer, 1, 1, 10.millis, Handling.default.onErrorSettle(Settlement.Drop))(_ =>
             IO.raiseError[Settlement](new RuntimeException("no"))
           )
           .take(1)

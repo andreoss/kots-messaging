@@ -213,6 +213,38 @@ abstract class QueueContract extends CatsEffectSuite {
     }
   }
 
+  test("a batch acknowledgement settles every delivery in it") {
+    val bodies = List("one", "two", "three")
+    withEndpoints { (producer, consumer) =>
+      for {
+        _ <- bodies.traverse_(body => producer.send(Message.of(body)))
+        held <- CapabilityChecks.batchWithin(consumer, bodies.size, 30.seconds)
+        _ <- consumer.ackAll(held)
+        again <- consumer.receive
+      } yield {
+        assertEquals(held.size, bodies.size)
+        assertEquals(again.map(_.envelope.message.payload), None)
+      }
+    }
+  }
+
+  test("a batch lease extension postpones every delivery in it") {
+    whenDeclared(Capability.LeaseExtension) { b =>
+      val destination = fresh
+      (b.producer(destination), b.consumer(destination, settings.withLease(2.seconds))).tupled
+        .use { case (producer, consumer) =>
+          for {
+            _ <- List("one", "two").traverse_(body => producer.send(Message.of(body)))
+            held <- CapabilityChecks.batchWithin(consumer, 2, 30.seconds)
+            _ <- consumer.extendAll(held, 30.seconds)
+            _ <- IO.sleep(3.seconds)
+            stolen <- consumer.receive
+            _ <- consumer.ackAll(held)
+          } yield assertEquals(stolen.map(_.envelope.message.payload), None)
+        }
+    }
+  }
+
   test("a released delivery is received again") {
     withEndpoints { (producer, consumer) =>
       for {

@@ -174,6 +174,12 @@ private final class AmqpBroker[F[_]](
           } yield responses.map(delivered)
         }
 
+      def ackAll(deliveries: List[Delivery[F, Array[Byte]]]): F[Unit] =
+        deliveries.traverse_(_.ack)
+
+      def extendAll(deliveries: List[Delivery[F, Array[Byte]]], by: FiniteDuration): F[Unit] =
+        F.raiseError(CapabilityUnsupported(Capability.LeaseExtension))
+
       private def fetch(room: Int, taken: List[GetResponse]): F[List[GetResponse]] =
         if (taken.size >= room) F.pure(taken)
         else

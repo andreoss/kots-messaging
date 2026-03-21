@@ -28,6 +28,24 @@ object Transcode {
       def receiveBatch(max: Int): F[List[Delivery[F, A]]] =
         underlying.receiveBatch(max).flatMap(_.traverse(decode))
 
+      def ackAll(deliveries: List[Delivery[F, A]]): F[Unit] = {
+        val (wrapped, other) = split(deliveries)
+        underlying.ackAll(wrapped) *> other.traverse_(_.ack)
+      }
+
+      def extendAll(deliveries: List[Delivery[F, A]], by: FiniteDuration): F[Unit] = {
+        val (wrapped, other) = split(deliveries)
+        underlying.extendAll(wrapped, by) *> other.traverse_(_.extend(by))
+      }
+
+      private def split(
+        deliveries: List[Delivery[F, A]]
+      ): (List[Delivery[F, Array[Byte]]], List[Delivery[F, A]]) =
+        deliveries.foldRight((List.empty[Delivery[F, Array[Byte]]], List.empty[Delivery[F, A]])) {
+          case (typed: Typed[F, A], (wrapped, other)) => (typed.underlying :: wrapped, other)
+          case (delivery, (wrapped, other)) => (wrapped, delivery :: other)
+        }
+
       private def decode(delivery: Delivery[F, Array[Byte]]): F[Delivery[F, A]] =
         F.fromEither(codec.decode(delivery.envelope.message.payload))
           .map(payload => typed(delivery, delivery.envelope.message.as(payload)))
@@ -57,14 +75,18 @@ object Transcode {
   private def typed[F[_], A](
     underlying: Delivery[F, Array[Byte]],
     message: Message[A],
-  ): Delivery[F, A] =
-    new Delivery[F, A] {
-      val envelope: Envelope[A] =
-        Envelope(underlying.envelope.id, message, underlying.envelope.attempt)
-      val ack: F[Unit] = underlying.ack
-      val reject: F[Unit] = underlying.reject
-      val release: F[Unit] = underlying.release
-      val deadLetter: F[Unit] = underlying.deadLetter
-      def extend(by: FiniteDuration): F[Unit] = underlying.extend(by)
-    }
+  ): Delivery[F, A] = new Typed(underlying, message)
+
+  private final class Typed[F[_], A](
+    val underlying: Delivery[F, Array[Byte]],
+    message: Message[A],
+  ) extends Delivery[F, A] {
+    val envelope: Envelope[A] =
+      Envelope(underlying.envelope.id, message, underlying.envelope.attempt)
+    val ack: F[Unit] = underlying.ack
+    val reject: F[Unit] = underlying.reject
+    val release: F[Unit] = underlying.release
+    val deadLetter: F[Unit] = underlying.deadLetter
+    def extend(by: FiniteDuration): F[Unit] = underlying.extend(by)
+  }
 }
