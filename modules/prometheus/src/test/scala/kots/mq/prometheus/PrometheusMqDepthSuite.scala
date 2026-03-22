@@ -39,7 +39,7 @@ final class PrometheusMqDepthSuite extends CatsEffectSuite {
     val registry = new PrometheusRegistry()
     for {
       sample <- PrometheusMqDepth.register[IO](registry)
-      _ <- sample(Admin.unknown[IO], destination)
+      _ <- sample(Admin.unsupported[IO], destination)
     } yield assert(gaugeValue(registry, "kots_mq_depth").forall(_ == 0.0d))
   }
 }

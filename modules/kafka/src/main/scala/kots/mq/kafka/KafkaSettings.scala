@@ -7,7 +7,9 @@ final case class KafkaSettings(
   bootstrapServers: String,
   groupPrefix: String,
   pollTimeout: FiniteDuration,
+  clientId: Option[String],
 ) {
+  def withClientId(name: String): KafkaSettings = copy(clientId = Some(name))
   def withGroupPrefix(prefix: String): KafkaSettings = copy(groupPrefix = prefix)
   def withPollTimeout(timeout: FiniteDuration): KafkaSettings = copy(pollTimeout = timeout)
 }
@@ -15,5 +17,5 @@ final case class KafkaSettings(
 object KafkaSettings {
 
   def local(bootstrapServers: String, groupPrefix: String): KafkaSettings =
-    KafkaSettings(bootstrapServers, groupPrefix, 1.second)
+    KafkaSettings(bootstrapServers, groupPrefix, 1.second, Some("kots-mq"))
 }

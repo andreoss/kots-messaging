@@ -73,7 +73,9 @@ private final class JmsBroker[F[_]](
     if (settings.prioritySupported) withDelay.and(Capability.Priority) else withDelay
   }
 
-  val admin: Admin[F] = Admin.unknown[F]
+  val events: BrokerEvents[F] = BrokerEvents.quiet[F]
+
+  val admin: Admin[F] = Admin.unsupported[F]
 
   private def sessionResource(mode: Int): Resource[F, Session] =
     Resource.make(F.blocking(connection.createSession(false, mode)))(session =>

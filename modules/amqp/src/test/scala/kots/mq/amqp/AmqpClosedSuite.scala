@@ -6,12 +6,10 @@ import munit.CatsEffectSuite
 
 import scala.concurrent.duration._
 
-final class AmqpClosedSuite extends CatsEffectSuite {
-
-  override def munitIOTimeout: Duration = 120.seconds
+final class AmqpClosedSuite extends AmqpSuite {
 
   test("receiving after the channel is closed fails rather than reporting an empty queue") {
-    val destination = AmqpTestSupport.queue("closed")
+    val destination = queue("closed")
     AmqpTestSupport.broker().use { broker =>
       broker
         .consumer(destination, AmqpTestSupport.settingsWithoutBackoff)
@@ -22,7 +20,7 @@ final class AmqpClosedSuite extends CatsEffectSuite {
   }
 
   test("publishing after the channel is closed fails rather than reporting success") {
-    val destination = AmqpTestSupport.queue("closed-publish")
+    val destination = queue("closed-publish")
     AmqpTestSupport.broker().use { broker =>
       broker
         .producer(destination)

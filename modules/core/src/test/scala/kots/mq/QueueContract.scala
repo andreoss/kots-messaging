@@ -20,8 +20,30 @@ abstract class QueueContract extends CatsEffectSuite {
 
   private val nonce: String = java.lang.Long.toHexString(System.nanoTime())
 
-  private def fresh: Destination =
-    Destination(s"${getClass.getSimpleName}-$nonce-${counter.incrementAndGet()}")
+  private val created = new java.util.concurrent.ConcurrentLinkedQueue[Destination]()
+
+  private def fresh: Destination = {
+    val destination =
+      Destination(s"${getClass.getSimpleName}-$nonce-${counter.incrementAndGet()}")
+    created.add(destination)
+    destination
+  }
+
+  override def afterAll(): Unit = {
+    val removal = broker.use { b =>
+      if (!b.capabilities.has(Capability.Topology)) IO.unit
+      else {
+        val destinations = Iterator
+          .continually(Option(created.poll()))
+          .takeWhile(_.isDefined)
+          .flatten
+          .toList
+        destinations.traverse_(destination => b.admin.delete(destination).attempt.void)
+      }
+    }
+    removal.attempt.unsafeRunTimed(30.seconds)
+    super.afterAll()
+  }
 
   private def withEndpoints[A](
     f: (Producer[IO, String], Consumer[IO, String]) => IO[A]
@@ -279,6 +301,19 @@ abstract class QueueContract extends CatsEffectSuite {
             assertEquals(stale.map(_.envelope.message.payload), None)
           }
       }
+    }
+  }
+
+  test("a destination can be declared, purged and deleted where topology is declared") {
+    whenDeclared(Capability.Topology) { b =>
+      val destination = fresh
+      for {
+        _ <- b.admin.declare(destination)
+        _ <- b.producer(destination).use(_.send(Message.of("body")))
+        _ <- b.admin.purge(destination)
+        _ <- b.admin.delete(destination)
+        depth <- b.admin.depth(destination)
+      } yield assert(depth.forall(_ == 0L), s"a deleted destination reported $depth")
     }
   }
 

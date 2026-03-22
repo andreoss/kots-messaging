@@ -7,12 +7,10 @@ import munit.CatsEffectSuite
 
 import scala.concurrent.duration._
 
-final class AmqpConfirmSuite extends CatsEffectSuite {
-
-  override def munitIOTimeout: Duration = 120.seconds
+final class AmqpConfirmSuite extends AmqpSuite {
 
   test("a confirmed publish returns the identity the consumer reads back") {
-    val destination = AmqpTestSupport.queue("confirms")
+    val destination = queue("confirms")
     AmqpTestSupport.broker().use { broker =>
       (broker.consumer(destination, AmqpTestSupport.settingsWithoutBackoff), broker.producer(destination))
         .tupled
@@ -27,26 +25,29 @@ final class AmqpConfirmSuite extends CatsEffectSuite {
   }
 
   test("an unroutable mandatory publish fails the effect") {
-    val missing = AmqpTestSupport.queue("never-declared")
+    val missing = queue("never-declared")
     AmqpTestSupport.broker(AmqpSettings.local(AmqpTestSupport.uri).withMandatory(true)).use {
       broker =>
         broker
           .producer(missing)
           .use(_.send(Message.of("body")))
           .attempt
-          .map(result => assert(result.left.exists(_.isInstanceOf[AmqpPublishFailed]), result.toString))
+          .map(result =>
+          assert(
+            result.left.exists(_.isInstanceOf[AmqpPublishFailed.Unroutable]),
+            result.toString,
+          )
+        )
     }
   }
 }
 
-final class AmqpPipelineSuite extends CatsEffectSuite {
-
-  override def munitIOTimeout: Duration = 180.seconds
+final class AmqpPipelineSuite extends AmqpSuite {
 
   private val bodies = List.range(0, 20).map(index => Message.of(s"body-$index"))
 
   test("confirms overlap: twenty publishes cost far less than twenty round trips") {
-    val destination = AmqpTestSupport.queue("pipelined")
+    val destination = queue("pipelined")
     AmqpTestSupport.broker().use { broker =>
       (
         broker.consumer(destination, AmqpTestSupport.settingsWithoutBackoff.withPrefetch(64)),
@@ -74,7 +75,7 @@ final class AmqpPipelineSuite extends CatsEffectSuite {
   }
 
   test("a publish is confirmed before its identity is returned") {
-    val destination = AmqpTestSupport.queue("confirmed-order")
+    val destination = queue("confirmed-order")
     AmqpTestSupport.broker().use { broker =>
       (
         broker.consumer(destination, AmqpTestSupport.settingsWithoutBackoff.withPrefetch(32)),
@@ -90,5 +91,39 @@ final class AmqpPipelineSuite extends CatsEffectSuite {
         }
       }
     }
+  }
+}
+
+final class AmqpFailoverSuite extends AmqpSuite {
+
+  test("a client survives the first endpoint being down") {
+    val destination = queue("failover")
+    val settings = AmqpSettings
+      .local(AmqpTestSupport.uri)
+      .withUris(List("amqp://guest:guest@127.0.0.1:1", AmqpTestSupport.uri))
+      .withConnectionName("kots-mq-failover")
+    AmqpTestSupport.broker(settings).use { broker =>
+      (
+        broker.consumer(destination, AmqpTestSupport.settingsWithoutBackoff),
+        broker.producer(destination),
+      ).tupled.use { case (consumer, producer) =>
+        for {
+          _ <- producer.send(Message.of("body"))
+          received <- CapabilityChecks.receiveWithin(consumer, 30.seconds)
+          _ <- received.traverse_(_.ack)
+        } yield assertEquals(received.map(_.envelope.message.payload), Some("body"))
+      }
+    }
+  }
+
+  test("no endpoint that answers is reported as the last failure") {
+    val settings = AmqpSettings
+      .local(AmqpTestSupport.uri)
+      .withUris(List("amqp://guest:guest@127.0.0.1:1", "amqp://guest:guest@127.0.0.1:2"))
+    AmqpTestSupport
+      .broker(settings)
+      .use(_ => IO.unit)
+      .attempt
+      .map(result => assert(result.isLeft, "a broker with no endpoint connected anyway"))
   }
 }

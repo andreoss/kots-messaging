@@ -6,6 +6,7 @@ import cats.syntax.all._
 import com.rabbitmq.client.{
   AMQP,
   Channel,
+  BlockedListener,
   ConfirmListener,
   Connection,
   ConnectionFactory,
@@ -36,13 +37,36 @@ object AmqpBroker {
   def bytes[F[_]](settings: AmqpSettings, entropy: Entropy[F])(implicit
     F: Async[F]
   ): Resource[F, Broker[F, Array[Byte]]] =
-    Resource
-      .make(F.blocking {
-        val factory = new ConnectionFactory()
-        factory.setUri(settings.uri)
-        factory.newConnection()
-      })(connection => F.blocking(connection.close()))
-      .map(new AmqpBroker[F](_, settings, entropy))
+    for {
+      blocked <- Resource.eval(F.delay(new AtomicReference[Option[String]](None)))
+      connection <- Resource.make(connect[F](settings))(open => F.blocking(open.close()))
+      _ <- Resource.eval(
+        F.blocking(
+          connection.addBlockedListener(new BlockedListener {
+            def handleBlocked(reason: String): Unit = blocked.set(Some(reason))
+            def handleUnblocked(): Unit = blocked.set(None)
+          })
+        )
+      )
+    } yield new AmqpBroker[F](connection, settings, entropy, blocked)
+
+  /** Tries each endpoint in order; the first that answers is the one used. */
+  private def connect[F[_]](settings: AmqpSettings)(implicit F: Async[F]): F[Connection] = {
+    def attempt(remaining: List[String], last: Option[Throwable]): F[Connection] =
+      remaining match {
+        case Nil =>
+          F.raiseError(
+            last.getOrElse(new IllegalArgumentException("no endpoint was given to connect to"))
+          )
+        case uri :: rest =>
+          F.blocking {
+            val factory = new ConnectionFactory()
+            factory.setUri(uri)
+            settings.connectionName.fold(factory.newConnection())(factory.newConnection)
+          }.handleErrorWith(error => attempt(rest, Some(error)))
+      }
+    attempt(settings.uris, None)
+  }
 
   private[amqp] def queueArguments(deadLetter: Option[Destination]): Map[String, AnyRef] =
     deadLetter.fold(Map.empty[String, AnyRef])(parked =>
@@ -54,21 +78,47 @@ private final class AmqpBroker[F[_]](
   connection: Connection,
   settings: AmqpSettings,
   entropy: Entropy[F],
+  blockedState: AtomicReference[Option[String]],
 )(implicit F: Async[F])
   extends Broker[F, Array[Byte]] {
 
   import AmqpBroker._
 
   val capabilities: Capabilities =
-    Capabilities.of(Capability.Batch, Capability.Delay, Capability.DeadLetter)
+    Capabilities.of(
+      Capability.Batch,
+      Capability.Delay,
+      Capability.DeadLetter,
+      Capability.Topology,
+    )
+
+  val events: BrokerEvents[F] = new BrokerEvents[F] {
+    val blocked: F[Option[String]] = F.delay(blockedState.get)
+  }
 
   val admin: Admin[F] = new Admin[F] {
+
     def depth(destination: Destination): F[Option[Long]] =
       channelResource
         .use(channel =>
           F.blocking(Option(channel.queueDeclarePassive(destination.name).getMessageCount.toLong))
         )
         .recover { case _: Throwable => None }
+
+    def declare(destination: Destination): F[Unit] =
+      channelResource.use(channel =>
+        F.blocking(
+          channel.queueDeclare(destination.name, true, false, false, Map.empty[String, AnyRef].asJava)
+        ).void
+      )
+
+    def purge(destination: Destination): F[Option[Long]] =
+      channelResource.use(channel =>
+        F.blocking(Option(channel.queuePurge(destination.name).getMessageCount.toLong))
+      )
+
+    def delete(destination: Destination): F[Unit] =
+      channelResource.use(channel => F.blocking(channel.queueDelete(destination.name)).void)
   }
 
   private def channelResource: Resource[F, Channel] =
@@ -77,7 +127,7 @@ private final class AmqpBroker[F[_]](
   private final class Confirming(
     val channel: Channel,
     val guard: Mutex[F],
-    val returned: AtomicReference[Option[String]],
+    val returned: AtomicReference[Option[AmqpPublishFailed]],
     val pending: Ref[F, Map[Long, Deferred[F, Either[String, Unit]]]],
   ) {
 
@@ -98,7 +148,7 @@ private final class AmqpBroker[F[_]](
       _ <- Resource.eval(F.blocking(channel.confirmSelect()))
       dispatcher <- Dispatcher.parallel[F](await = false)
       guard <- Resource.eval(Mutex[F])
-      returned <- Resource.eval(F.delay(new AtomicReference[Option[String]](None)))
+      returned <- Resource.eval(F.delay(new AtomicReference[Option[AmqpPublishFailed]](None)))
       pending <- Resource.eval(F.ref(Map.empty[Long, Deferred[F, Either[String, Unit]]]))
       publisher = new Confirming(channel, guard, returned, pending)
       _ <- Resource.eval(
@@ -120,7 +170,8 @@ private final class AmqpBroker[F[_]](
               routingKey: String,
               properties: AMQP.BasicProperties,
               body: Array[Byte],
-            ): Unit = returned.set(Some(s"unroutable: $replyText"))
+            ): Unit =
+              returned.set(Some(AmqpPublishFailed.returned(replyCode, replyText, routingKey)))
           })
         }
       )
@@ -320,10 +371,12 @@ private final class AmqpBroker[F[_]](
     )
   }
 
-  private def unroutable(returned: AtomicReference[Option[String]]): F[Option[String]] =
+  private def unroutable(
+    returned: AtomicReference[Option[AmqpPublishFailed]]
+  ): F[Option[AmqpPublishFailed]] =
     if (!settings.mandatory) F.pure(None)
     else {
-      def poll(left: Int): F[Option[String]] =
+      def poll(left: Int): F[Option[AmqpPublishFailed]] =
         F.delay(returned.get).flatMap {
           case found @ Some(_) => F.pure(found)
           case None if left > 0 => F.sleep(100.millis) *> poll(left - 1)
@@ -362,17 +415,35 @@ private final class AmqpBroker[F[_]](
 
       val awaited: F[MessageId] =
         for {
+          refusal <- F.delay(blockedState.get)
+          _ <- refusal.traverse_(reason =>
+            F.raiseError[Unit](
+              AmqpPublishFailed.Refused(s"the broker is blocking publishes: $reason")
+            )
+          )
           confirmation <- if (settings.mandatory) send else publisher.guard.lock.surround(send)
           outcome <- F.timeoutTo(
             confirmation.get,
             settings.confirmTimeout,
             F.pure(Left("the broker did not confirm the publish"): Either[String, Unit]),
           )
-          _ <- outcome.fold(reason => F.raiseError[Unit](AmqpPublishFailed(reason)), _ => F.unit)
+          _ <- outcome.fold(
+            reason => F.raiseError[Unit](AmqpPublishFailed.NotConfirmed(reason)),
+            _ => F.unit,
+          )
           failure <- unroutable(publisher.returned)
-          _ <- failure.traverse_(reason => F.raiseError[Unit](AmqpPublishFailed(reason)))
+          _ <- failure.traverse_(F.raiseError[Unit](_))
         } yield MessageId(id)
 
-      if (settings.mandatory) publisher.guard.lock.surround(awaited) else awaited
+      val attempted =
+        if (settings.mandatory) publisher.guard.lock.surround(awaited) else awaited
+
+      F.timeoutTo(
+        attempted,
+        settings.confirmTimeout * 2,
+        F.raiseError[MessageId](
+          AmqpPublishFailed.NotConfirmed("the broker did not take the publish in time")
+        ),
+      )
     }
 }

@@ -7,13 +7,11 @@ import munit.CatsEffectSuite
 
 import scala.concurrent.duration._
 
-final class AmqpDeadLetterSuite extends CatsEffectSuite {
-
-  override def munitIOTimeout: Duration = 120.seconds
+final class AmqpDeadLetterSuite extends AmqpSuite {
 
   test("a spent message is routed by the broker's dead-letter exchange") {
-    val source = AmqpTestSupport.queue("poison")
-    val parked = AmqpTestSupport.queue("poison-dead")
+    val source = queue("poison")
+    val parked = queue("poison-dead")
     val spent = AmqpTestSupport.settingsWithoutBackoff.withMaxAttempts(1).withDeadLetter(parked)
     AmqpTestSupport.broker().use { broker =>
       (
@@ -38,7 +36,7 @@ final class AmqpDeadLetterSuite extends CatsEffectSuite {
   }
 
   test("a message within its budget is republished with a higher attempt") {
-    val source = AmqpTestSupport.queue("retry")
+    val source = queue("retry")
     AmqpTestSupport.broker().use { broker =>
       (
         broker.consumer(source, AmqpTestSupport.settingsWithoutBackoff),

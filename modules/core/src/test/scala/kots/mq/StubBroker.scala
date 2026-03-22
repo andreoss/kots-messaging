@@ -14,9 +14,21 @@ object StubBroker {
 
         val capabilities: Capabilities = declared
 
+        val events: BrokerEvents[F] = BrokerEvents.quiet[F]
+
         val admin: Admin[F] = new Admin[F] {
           def depth(destination: Destination): F[Option[Long]] =
             state.get.map { case (queue, _) => Some(queue.size.toLong) }
+
+          def declare(destination: Destination): F[Unit] = F.unit
+
+          def purge(destination: Destination): F[Option[Long]] =
+            state.modify { case (queue, published) =>
+              ((Vector.empty, published), Some(queue.size.toLong))
+            }
+
+          def delete(destination: Destination): F[Unit] =
+            state.update { case (_, published) => (Vector.empty, published) }
         }
 
         def producer(destination: Destination): Resource[F, Producer[F, A]] =

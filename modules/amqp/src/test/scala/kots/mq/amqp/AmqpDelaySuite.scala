@@ -7,12 +7,10 @@ import munit.CatsEffectSuite
 
 import scala.concurrent.duration._
 
-final class AmqpDelaySuite extends CatsEffectSuite {
-
-  override def munitIOTimeout: Duration = 120.seconds
+final class AmqpDelaySuite extends AmqpSuite {
 
   test("a delayed message waits in the broker's holding queue") {
-    val destination = AmqpTestSupport.queue("delayed")
+    val destination = queue("delayed")
     AmqpTestSupport.broker().use { broker =>
       (
         broker.consumer(destination, AmqpTestSupport.settingsWithoutBackoff),

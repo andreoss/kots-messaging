@@ -6,6 +6,7 @@ import cats.effect.kernel.Resource
 trait Broker[F[_], A] {
   def capabilities: Capabilities
   def admin: Admin[F]
+  def events: BrokerEvents[F]
   def producer(destination: Destination): Resource[F, Producer[F, A]]
   def consumer(destination: Destination, settings: ConsumerSettings): Resource[F, Consumer[F, A]]
 }

@@ -10,6 +10,7 @@ object Capability {
   case object DeadLetter extends Capability
   case object Batch extends Capability
   case object LeaseExtension extends Capability
+  case object Topology extends Capability
 }
 
 /** What one adapter declares it honours. */

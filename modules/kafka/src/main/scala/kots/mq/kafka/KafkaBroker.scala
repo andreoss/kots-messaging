@@ -4,6 +4,13 @@ import cats.effect.kernel.{Async, Ref, Resource}
 import cats.effect.std.Mutex
 import cats.syntax.all._
 import kots.mq._
+import org.apache.kafka.clients.admin.{
+  Admin => KafkaAdmin,
+  AdminClientConfig,
+  NewTopic,
+  OffsetSpec,
+  RecordsToDelete,
+}
 import org.apache.kafka.clients.consumer.{ConsumerConfig, ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
 import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
 import org.apache.kafka.common.TopicPartition
@@ -34,6 +41,7 @@ object KafkaBroker {
     val properties = new Properties()
     properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, settings.bootstrapServers)
     properties.put(ProducerConfig.ACKS_CONFIG, "all")
+    settings.clientId.foreach(properties.put(ProducerConfig.CLIENT_ID_CONFIG, _))
     properties.put(
       ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
       classOf[ByteArraySerializer].getName,
@@ -55,6 +63,9 @@ object KafkaBroker {
     properties.put(ConsumerConfig.GROUP_ID_CONFIG, s"${settings.groupPrefix}-${destination.name}")
     properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
     properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
+    settings.clientId.foreach(name =>
+      properties.put(ConsumerConfig.CLIENT_ID_CONFIG, s"$name-${destination.name}")
+    )
     properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, Integer.valueOf(consumer.prefetch))
     properties.put(
       ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
@@ -93,9 +104,78 @@ private final class KafkaBroker[F[_]](
   import KafkaBroker._
 
   val capabilities: Capabilities =
-    Capabilities.of(Capability.Batch, Capability.DeadLetter, Capability.OrderingGroup)
+    Capabilities.of(
+      Capability.Batch,
+      Capability.DeadLetter,
+      Capability.OrderingGroup,
+      Capability.Topology,
+    )
+
+  val events: BrokerEvents[F] = BrokerEvents.quiet[F]
+
+  private def adminClient: Resource[F, KafkaAdmin] =
+    Resource.make(
+      F.blocking {
+        val properties = new Properties()
+        properties.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, settings.bootstrapServers)
+        KafkaAdmin.create(properties)
+      }
+    )(client => F.blocking(client.close(JavaDuration.ofSeconds(5))))
 
   val admin: Admin[F] = new Admin[F] {
+
+    def declare(destination: Destination): F[Unit] =
+      adminClient
+        .use(client =>
+          F.blocking(
+            client
+              .createTopics(Collections.singletonList(new NewTopic(destination.name, 1, 1.toShort)))
+              .all()
+              .get()
+          )
+        )
+        .void
+        .recover { case _: Throwable => () }
+
+    def purge(destination: Destination): F[Option[Long]] =
+      adminClient.use { client =>
+        F.blocking {
+          val description = client.describeTopics(Collections.singletonList(destination.name))
+          val partitions = description
+            .allTopicNames()
+            .get()
+            .get(destination.name)
+            .partitions()
+            .asScala
+            .map(partition => new TopicPartition(destination.name, partition.partition()))
+            .toList
+          val ends = client
+            .listOffsets(
+              partitions
+                .map(partition =>
+                  partition -> (OffsetSpec.latest(): OffsetSpec)
+                )
+                .toMap
+                .asJava
+            )
+            .all()
+            .get()
+          val removals = partitions
+            .map(partition => partition -> RecordsToDelete.beforeOffset(ends.get(partition).offset()))
+            .toMap
+          client.deleteRecords(removals.asJava).all().get()
+          Option(removals.values.map(_.beforeOffset()).sum)
+        }
+      }.recover { case _: Throwable => None }
+
+    def delete(destination: Destination): F[Unit] =
+      adminClient
+        .use(client =>
+          F.blocking(client.deleteTopics(Collections.singletonList(destination.name)).all().get())
+        )
+        .void
+        .recover { case _: Throwable => () }
+
     def depth(destination: Destination): F[Option[Long]] =
       Resource
         .make(

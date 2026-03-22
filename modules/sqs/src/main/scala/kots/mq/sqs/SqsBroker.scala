@@ -14,12 +14,14 @@ import software.amazon.awssdk.services.sqs.model.{
   DeleteMessageBatchRequest,
   DeleteMessageBatchRequestEntry,
   DeleteMessageRequest,
+  DeleteQueueRequest,
   GetQueueAttributesRequest,
   GetQueueUrlRequest,
   Message => SqsMessage,
   MessageAttributeValue,
   MessageSystemAttributeName,
   QueueAttributeName,
+  PurgeQueueRequest,
   QueueDoesNotExistException,
   ReceiveMessageRequest,
   SendMessageBatchRequest,
@@ -80,7 +82,10 @@ private final class SqsBroker[F[_]](
       Capability.Delay,
       Capability.DeadLetter,
       Capability.LeaseExtension,
+      Capability.Topology,
     )
+
+  val events: BrokerEvents[F] = BrokerEvents.quiet[F]
 
   val admin: Admin[F] = new Admin[F] {
     def depth(destination: Destination): F[Option[Long]] =
@@ -101,6 +106,25 @@ private final class SqsBroker[F[_]](
         )
         .map(value => Option(value).flatMap(_.toLongOption))
         .recover { case _: Throwable => None }
+
+    def declare(destination: Destination): F[Unit] =
+      F.blocking(
+        client.createQueue(CreateQueueRequest.builder().queueName(destination.name).build())
+      ).void
+
+    def purge(destination: Destination): F[Option[Long]] =
+      queueUrl(destination)
+        .flatMap(url =>
+          F.blocking(client.purgeQueue(PurgeQueueRequest.builder().queueUrl(url).build()))
+        )
+        .as(Option.empty[Long])
+
+    def delete(destination: Destination): F[Unit] =
+      queueUrl(destination)
+        .flatMap(url =>
+          F.blocking(client.deleteQueue(DeleteQueueRequest.builder().queueUrl(url).build()))
+        )
+        .void
   }
 
   def producer(destination: Destination): Resource[F, Producer[F, Array[Byte]]] =

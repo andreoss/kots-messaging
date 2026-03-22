@@ -52,12 +52,35 @@ private final class MemBroker[F[_], A](
       Capability.DeadLetter,
       Capability.Batch,
       Capability.LeaseExtension,
+      Capability.Topology,
     )
 
+  val events: BrokerEvents[F] = BrokerEvents.quiet[F]
+
   val admin: Admin[F] = new Admin[F] {
+
     def depth(destination: Destination): F[Option[Long]] =
       state.get.map(current =>
         Some(current.ready.getOrElse(destination, Vector.empty).size.toLong)
+      )
+
+    def declare(destination: Destination): F[Unit] =
+      state.update(current =>
+        current.copy(ready = current.ready.updated(destination, current.ready.getOrElse(destination, Vector.empty)))
+      )
+
+    def purge(destination: Destination): F[Option[Long]] =
+      state.modify { current =>
+        val waiting = current.ready.getOrElse(destination, Vector.empty).size.toLong
+        (current.copy(ready = current.ready.updated(destination, Vector.empty)), Some(waiting))
+      }
+
+    def delete(destination: Destination): F[Unit] =
+      state.update(current =>
+        current.copy(
+          ready = current.ready - destination,
+          leased = current.leased.filterNot { case (_, lease) => lease.destination == destination },
+        )
       )
   }
 

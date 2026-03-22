@@ -18,8 +18,15 @@ object MqInterop {
 
       val capabilities: Capabilities = broker.capabilities
 
+      val events: BrokerEvents[G] = new BrokerEvents[G] {
+        val blocked: G[Option[String]] = fk(broker.events.blocked)
+      }
+
       val admin: Admin[G] = new Admin[G] {
         def depth(destination: Destination): G[Option[Long]] = fk(broker.admin.depth(destination))
+        def declare(destination: Destination): G[Unit] = fk(broker.admin.declare(destination))
+        def purge(destination: Destination): G[Option[Long]] = fk(broker.admin.purge(destination))
+        def delete(destination: Destination): G[Unit] = fk(broker.admin.delete(destination))
       }
 
       def producer(destination: Destination): Resource[G, Producer[G, A]] =

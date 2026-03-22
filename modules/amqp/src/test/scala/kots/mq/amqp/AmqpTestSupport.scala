@@ -2,6 +2,7 @@ package kots.mq.amqp
 
 import cats.effect.IO
 import cats.effect.kernel.Resource
+import cats.syntax.all._
 import kots.mq._
 
 object AmqpTestSupport {
