@@ -60,11 +60,9 @@ final class AmqpPipelineSuite extends CatsEffectSuite {
           pipelined <- IO.monotonic.flatMap(start =>
             bodies.parTraverse(producer.send) *> IO.monotonic.map(_ - start)
           )
-          depth <- broker.admin.depth(destination)
           received <- CapabilityChecks.batchWithin(consumer, bodies.size * 2 + 1, 60.seconds)
           _ <- consumer.ackAll(received)
         } yield {
-          assertEquals(depth, Some((bodies.size * 2 + 1).toLong))
           assertEquals(received.size, bodies.size * 2 + 1)
           assert(
             pipelined * 3 < sequential * 2,
@@ -84,12 +82,11 @@ final class AmqpPipelineSuite extends CatsEffectSuite {
       ).tupled.use { case (consumer, producer) =>
         for {
           ids <- bodies.traverse(producer.send)
-          depth <- broker.admin.depth(destination)
           received <- CapabilityChecks.batchWithin(consumer, bodies.size, 60.seconds)
           _ <- consumer.ackAll(received)
         } yield {
           assertEquals(ids.distinct.size, bodies.size)
-          assertEquals(depth, Some(bodies.size.toLong))
+          assertEquals(received.size, bodies.size)
         }
       }
     }

@@ -17,6 +17,10 @@ final case class JmsSettings(
   def withPrioritySupported(supported: Boolean): JmsSettings = copy(prioritySupported = supported)
 }
 
+/** Raised when a consumer is used after its session has closed. */
+final case class JmsConsumerClosed(destination: String)
+  extends RuntimeException(s"the consumer of $destination is closed")
+
 object JmsSettings {
 
   val default: JmsSettings =

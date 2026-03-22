@@ -176,3 +176,40 @@ final class MqStreamSettleSuite extends CatsEffectSuite {
     }
   }
 }
+
+final class MqStreamDrainSuite extends CatsEffectSuite {
+
+  private val destination = Destination("drained")
+
+  private val settings = ConsumerSettings.default.withBackoff(Backoff.none)
+
+  private def endpoints[A](
+    f: (Producer[IO, String], Consumer[IO, String]) => IO[A]
+  ): IO[A] =
+    MemBroker.create[IO, String](Entropy.const[IO](1.0)).flatMap { broker =>
+      (broker.producer(destination), broker.consumer(destination, settings)).tupled.use {
+        case (producer, consumer) => f(producer, consumer)
+      }
+    }
+
+  test("draining ends when the destination is empty") {
+    val bodies = List("one", "two", "three")
+    endpoints { (producer, consumer) =>
+      for {
+        _ <- bodies.traverse_(body => producer.send(Message.of(body)))
+        drained <- MqStream
+          .drain(consumer, 2)
+          .evalTap(_.ack)
+          .map(_.envelope.message.payload)
+          .compile
+          .toList
+      } yield assertEquals(drained, bodies)
+    }
+  }
+
+  test("draining an empty destination ends at once") {
+    endpoints((_, consumer) =>
+      MqStream.drain(consumer, 4).compile.toList.map(drained => assertEquals(drained, Nil))
+    )
+  }
+}

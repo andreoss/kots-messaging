@@ -26,10 +26,14 @@ object JmsTestSupport {
       .withAcknowledgeMode(org.apache.activemq.ActiveMQSession.INDIVIDUAL_ACKNOWLEDGE)
       .withReceiveTimeout(300.millis)
 
-  def artemisFactory: ConnectionFactory = {
+  def artemisFactory: ConnectionFactory = artemisFactoryWindowed(1024 * 1024)
+
+  /** The consumer window is what the provider hands out before choosing again. */
+  def artemisFactoryWindowed(windowSize: Int): ConnectionFactory = {
     val factory = new org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory(artemisUrl)
     factory.setUser("artemis")
     factory.setPassword("artemis")
+    factory.setConsumerWindowSize(windowSize)
     factory
   }
 

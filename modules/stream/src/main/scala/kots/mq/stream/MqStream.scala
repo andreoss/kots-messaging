@@ -20,6 +20,16 @@ object MqStream {
       .evalTap(batch => F.sleep(idle).whenA(batch.isEmpty))
       .flatMap(Stream.emits)
 
+  /** Every delivery until the destination is drained, then done. */
+  def drain[F[_], A](
+    consumer: Consumer[F, A],
+    chunkSize: Int,
+  )(implicit F: Temporal[F]): Stream[F, Delivery[F, A]] =
+    Stream
+      .repeatEval(consumer.receiveBatch(chunkSize))
+      .takeWhile(_.nonEmpty)
+      .flatMap(Stream.emits)
+
   def process[F[_], A](
     consumer: Consumer[F, A],
     concurrency: Int,

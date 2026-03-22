@@ -1,13 +1,14 @@
 package kots.mq.jms
 
 import cats.effect.kernel.{Async, Resource}
-import cats.effect.std.Mutex
+import cats.effect.std.{Dispatcher, Mutex, Queue}
 import cats.syntax.all._
 import jakarta.jms.{
   BytesMessage,
   Connection,
   ConnectionFactory,
   Message => JmsMessage,
+  MessageListener,
   MessageProducer,
   Session,
 }
@@ -114,19 +115,28 @@ private final class JmsBroker[F[_]](
       guard <- Resource.eval(Mutex[F])
       retryGuard <- Resource.eval(Mutex[F])
       inflight <- Resource.eval(F.ref(Set.empty[String]))
+      arrivals <- Resource.eval(Queue.bounded[F, JmsMessage](consumerSettings.prefetch max 1))
+      dispatcher <- Dispatcher.parallel[F](await = false)
+      open <- Resource.make(F.ref(true))(_.set(false))
+      _ <- Resource.eval(
+        F.blocking(
+          reader.setMessageListener(new MessageListener {
+            def onMessage(message: JmsMessage): Unit =
+              dispatcher.unsafeRunAndForget(arrivals.offer(message))
+          })
+        )
+      )
     } yield new Consumer[F, Array[Byte]] {
 
       def receive: F[Option[Delivery[F, Array[Byte]]]] = receiveBatch(1).map(_.headOption)
 
       def receiveBatch(max: Int): F[List[Delivery[F, Array[Byte]]]] =
-        guard.lock.surround {
-          for {
-            held <- inflight.get
-            room = math.max(0, math.min(max, consumerSettings.prefetch - held.size))
-            messages <- poll(room, Nil)
-            _ <- inflight.update(_ ++ messages.map(_.getJMSMessageID))
-          } yield messages.map(delivered(_, destination, consumerSettings))
-        }
+        for {
+          held <- inflight.get
+          room = math.max(0, math.min(max, consumerSettings.prefetch - held.size))
+          messages <- poll(room, Nil)
+          _ <- inflight.update(_ ++ messages.map(_.getJMSMessageID))
+        } yield messages.map(delivered(_, destination, consumerSettings))
 
       def ackAll(deliveries: List[Delivery[F, Array[Byte]]]): F[Unit] =
         deliveries.traverse_(_.ack)
@@ -136,8 +146,18 @@ private final class JmsBroker[F[_]](
 
       private def poll(room: Int, taken: List[JmsMessage]): F[List[JmsMessage]] =
         if (taken.size >= room) F.pure(taken)
+        else if (taken.isEmpty)
+          F.timeoutTo(
+            arrivals.take.map(Option(_)),
+            settings.receiveTimeout,
+            F.pure(Option.empty[JmsMessage]),
+          ).flatMap {
+            case Some(message) => poll(room, taken :+ message)
+            case None =>
+              open.get.ifM(F.pure(taken), F.raiseError(JmsConsumerClosed(destination.name)))
+          }
         else
-          F.blocking(Option(reader.receive(settings.receiveTimeout.toMillis))).flatMap {
+          arrivals.tryTake.flatMap {
             case Some(message) => poll(room, taken :+ message)
             case None => F.pure(taken)
           }

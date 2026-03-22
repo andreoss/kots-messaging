@@ -1,7 +1,7 @@
 package kots.mq.amqp
 
 import cats.effect.kernel.{Async, Deferred, Ref, Resource}
-import cats.effect.std.{Dispatcher, Mutex}
+import cats.effect.std.{Dispatcher, Mutex, Queue}
 import cats.syntax.all._
 import com.rabbitmq.client.{
   AMQP,
@@ -9,7 +9,7 @@ import com.rabbitmq.client.{
   ConfirmListener,
   Connection,
   ConnectionFactory,
-  GetResponse,
+  DefaultConsumer,
   ReturnListener,
 }
 import kots.mq._
@@ -25,6 +25,13 @@ object AmqpBroker {
   private[amqp] val keyHeader = "x-mq-key"
   private[amqp] val deadLetterExchange = "x-dead-letter-exchange"
   private[amqp] val deadLetterRoutingKey = "x-dead-letter-routing-key"
+
+  private[amqp] final case class Pushed(
+    tag: Long,
+    redelivered: Boolean,
+    properties: AMQP.BasicProperties,
+    body: Array[Byte],
+  )
 
   def bytes[F[_]](settings: AmqpSettings, entropy: Entropy[F])(implicit
     F: Async[F]
@@ -192,6 +199,29 @@ private final class AmqpBroker[F[_]](
         ).void
       )
       inflight <- Resource.eval(F.ref(Set.empty[Long]))
+      arrivals <- Resource.eval(Queue.bounded[F, Pushed](consumerSettings.prefetch max 1))
+      dispatcher <- Dispatcher.parallel[F](await = false)
+      _ <- Resource.make(
+        F.blocking(
+          channel.basicConsume(
+            destination.name,
+            false,
+            new DefaultConsumer(channel) {
+              override def handleDelivery(
+                consumerTag: String,
+                envelope: com.rabbitmq.client.Envelope,
+                properties: AMQP.BasicProperties,
+                body: Array[Byte],
+              ): Unit =
+                dispatcher.unsafeRunAndForget(
+                  arrivals.offer(
+                    Pushed(envelope.getDeliveryTag, envelope.isRedeliver, properties, body)
+                  )
+                )
+            },
+          )
+        )
+      )(tag => F.blocking(channel.basicCancel(tag)).attempt.void)
     } yield new Consumer[F, Array[Byte]] {
 
       private val guard: Mutex[F] = publisher.guard
@@ -199,14 +229,12 @@ private final class AmqpBroker[F[_]](
       def receive: F[Option[Delivery[F, Array[Byte]]]] = receiveBatch(1).map(_.headOption)
 
       def receiveBatch(max: Int): F[List[Delivery[F, Array[Byte]]]] =
-        guard.lock.surround {
-          for {
-            held <- inflight.get
-            room = math.max(0, math.min(max, consumerSettings.prefetch - held.size))
-            responses <- fetch(room, Nil)
-            _ <- inflight.update(_ ++ responses.map(_.getEnvelope.getDeliveryTag))
-          } yield responses.map(delivered)
-        }
+        for {
+          held <- inflight.get
+          room = math.max(0, math.min(max, consumerSettings.prefetch - held.size))
+          taken <- fetch(room, Nil)
+          _ <- inflight.update(_ ++ taken.map(_.tag))
+        } yield taken.map(delivered)
 
       def ackAll(deliveries: List[Delivery[F, Array[Byte]]]): F[Unit] =
         deliveries.traverse_(_.ack)
@@ -214,20 +242,31 @@ private final class AmqpBroker[F[_]](
       def extendAll(deliveries: List[Delivery[F, Array[Byte]]], by: FiniteDuration): F[Unit] =
         F.raiseError(CapabilityUnsupported(Capability.LeaseExtension))
 
-      private def fetch(room: Int, taken: List[GetResponse]): F[List[GetResponse]] =
+      private def fetch(room: Int, taken: List[Pushed]): F[List[Pushed]] =
         if (taken.size >= room) F.pure(taken)
+        else if (taken.isEmpty)
+          F.timeoutTo(
+            arrivals.take.map(Option(_)),
+            settings.receiveTimeout,
+            F.pure(Option.empty[Pushed]),
+          ).flatMap {
+            case Some(pushed) => fetch(room, taken :+ pushed)
+            case None =>
+              F.blocking(channel.isOpen)
+                .ifM(F.pure(taken), F.raiseError(AmqpChannelClosed(destination.name)))
+          }
         else
-          F.blocking(Option(channel.basicGet(destination.name, false))).flatMap {
-            case Some(response) => fetch(room, taken :+ response)
+          arrivals.tryTake.flatMap {
+            case Some(pushed) => fetch(room, taken :+ pushed)
             case None => F.pure(taken)
           }
 
-      private def delivered(response: GetResponse): Delivery[F, Array[Byte]] =
+      private def delivered(pushed: Pushed): Delivery[F, Array[Byte]] =
         new Delivery[F, Array[Byte]] {
 
-          private val tag: Long = response.getEnvelope.getDeliveryTag
+          private val tag: Long = pushed.tag
 
-          val envelope: Envelope[Array[Byte]] = envelopeOf(response)
+          val envelope: Envelope[Array[Byte]] = envelopeOf(pushed)
 
           val ack: F[Unit] =
             guard.lock.surround(
@@ -263,20 +302,17 @@ private final class AmqpBroker[F[_]](
             F.raiseError(CapabilityUnsupported(Capability.LeaseExtension))
         }
     }
-
-  private def envelopeOf(response: GetResponse): Envelope[Array[Byte]] = {
-    val properties = response.getProps
-    val headers = Option(properties.getHeaders)
+  private def envelopeOf(pushed: Pushed): Envelope[Array[Byte]] = {
+    val headers = Option(pushed.properties.getHeaders)
       .fold(Map.empty[String, String])(
         _.asScala.view.map { case (name, value) => name -> value.toString }.toMap
       )
     val attempt = headers.get(attemptHeader).flatMap(_.toIntOption).getOrElse(1)
-    val id = Option(properties.getMessageId)
-      .getOrElse(response.getEnvelope.getDeliveryTag.toString)
+    val id = Option(pushed.properties.getMessageId).getOrElse(pushed.tag.toString)
     Envelope(
       MessageId(id),
       Message(
-        response.getBody,
+        pushed.body,
         headers - attemptHeader - keyHeader,
         headers.get(keyHeader).map(MessageKey.apply),
       ),
