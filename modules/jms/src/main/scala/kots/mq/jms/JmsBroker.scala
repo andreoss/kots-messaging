@@ -6,6 +6,7 @@ import cats.syntax.all._
 import jakarta.jms.{
   BytesMessage,
   Connection,
+  DeliveryMode,
   ConnectionFactory,
   Message => JmsMessage,
   MessageListener,
@@ -24,7 +25,7 @@ object JmsBroker {
   private[jms] val attemptProperty = "x_mq_attempt"
   private[jms] val keyProperty = "x_mq_key"
   private[jms] val headerPrefix = "x_mq_h_"
-  private[jms] val priorityHeader = "x-mq-priority"
+  private[jms] val contentTypeProperty = "x_mq_content_type"
 
   /** Property name for a header, so any header name is a valid identifier. */
   private[jms] def propertyOf(header: String): String =
@@ -68,7 +69,7 @@ private final class JmsBroker[F[_]](
   import JmsBroker._
 
   val capabilities: Capabilities = {
-    val base = Capabilities.of(Capability.Batch, Capability.DeadLetter)
+    val base = Capabilities.of(Capability.Batch, Capability.DeadLetter, Capability.Expiry)
     val withDelay = if (settings.delaySupported) base.and(Capability.Delay) else base
     if (settings.prioritySupported) withDelay.and(Capability.Priority) else withDelay
   }
@@ -239,10 +240,26 @@ private final class JmsBroker[F[_]](
     val headers = properties.toList.flatMap { case (property, value) =>
       headerOf(property).map(_ -> value)
     }.toMap
+    val carried = MessageProperties(
+      contentType = properties.get(contentTypeProperty),
+      correlationId = Option(message.getJMSCorrelationID),
+      replyTo = Option(message.getJMSReplyTo).collect { case queue: jakarta.jms.Queue =>
+        Destination(queue.getQueueName)
+      },
+      priority = Some(message.getJMSPriority),
+      persistent = message.getJMSDeliveryMode == DeliveryMode.PERSISTENT,
+      expiry = None,
+    )
     Envelope(
       MessageId(message.getJMSMessageID),
-      Message(payload, headers, properties.get(keyProperty).map(MessageKey.apply)),
+      Message(
+        payload,
+        headers,
+        properties.get(keyProperty).map(MessageKey.apply),
+        carried,
+      ),
       attempt,
+      message.getJMSRedelivered,
     )
   }
 
@@ -263,7 +280,17 @@ private final class JmsBroker[F[_]](
         }
         message.key.foreach(key => body.setStringProperty(keyProperty, key.value))
         body.setStringProperty(attemptProperty, attempt.toString)
-        message.headers.get(priorityHeader).flatMap(_.toIntOption).foreach(sender.setPriority)
+        val carried = message.properties
+        carried.contentType.foreach(body.setStringProperty(contentTypeProperty, _))
+        carried.correlationId.foreach(body.setJMSCorrelationID)
+        carried.replyTo.foreach(destination =>
+          body.setJMSReplyTo(session.createQueue(destination.name))
+        )
+        sender.setPriority(carried.priority.getOrElse(JmsMessage.DEFAULT_PRIORITY))
+        sender.setDeliveryMode(
+          if (carried.persistent) DeliveryMode.PERSISTENT else DeliveryMode.NON_PERSISTENT
+        )
+        sender.setTimeToLive(carried.expiry.fold(0L)(_.toMillis.max(0L)))
         if (settings.delaySupported)
           sender.setDeliveryDelay(delay.fold(0L)(_.toMillis.max(0L)))
         sender.send(body)

@@ -11,6 +11,7 @@ object Capability {
   case object Batch extends Capability
   case object LeaseExtension extends Capability
   case object Topology extends Capability
+  case object Expiry extends Capability
 }
 
 /** What one adapter declares it honours. */

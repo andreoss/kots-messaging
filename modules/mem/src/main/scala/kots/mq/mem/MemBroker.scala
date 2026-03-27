@@ -14,7 +14,11 @@ object MemBroker {
 
   private[mem] final case class ConsumerId(value: Long)
 
-  private[mem] final case class Pending[A](envelope: Envelope[A], visibleAt: FiniteDuration)
+  private[mem] final case class Pending[A](
+    envelope: Envelope[A],
+    visibleAt: FiniteDuration,
+    expiresAt: Option[FiniteDuration],
+  )
 
   private[mem] final case class Leased[A](
     destination: Destination,
@@ -53,6 +57,7 @@ private final class MemBroker[F[_], A](
       Capability.Batch,
       Capability.LeaseExtension,
       Capability.Topology,
+      Capability.Expiry,
     )
 
   val events: BrokerEvents[F] = BrokerEvents.quiet[F]
@@ -97,7 +102,11 @@ private final class MemBroker[F[_], A](
           state.modify { current =>
             val id = MessageId((current.published + 1).toString)
             val visibleAt = if (delay > Duration.Zero) now + delay else now
-            val pending = Pending(Envelope(id, message, 1), visibleAt)
+            val pending = Pending(
+              Envelope(id, message, 1),
+              visibleAt,
+              message.properties.expiry.map(after => now + after),
+            )
             (push(current, destination, pending).copy(published = current.published + 1), id)
           }
         }
@@ -170,7 +179,7 @@ private final class MemBroker[F[_], A](
               push(
                 current.copy(leased = current.leased - taken.id),
                 lease.destination,
-                Pending(lease.envelope, now),
+                Pending(lease.envelope, now, None),
               )
             )
           }
@@ -182,7 +191,7 @@ private final class MemBroker[F[_], A](
             held(current).fold(current) { lease =>
               val settled = current.copy(leased = current.leased - taken.id)
               lease.settings.deadLetter
-                .fold(settled)(parked => push(settled, parked, Pending(lease.envelope, now)))
+                .fold(settled)(parked => push(settled, parked, Pending(lease.envelope, now, None)))
             }
           }
         }
@@ -222,7 +231,9 @@ private final class MemBroker[F[_], A](
     ): (State[A], List[(Envelope[A], Long)]) =
       if (left <= 0) (accumulated, taken.reverse)
       else {
-        val queue = accumulated.ready.getOrElse(destination, Vector.empty)
+        val queue = accumulated.ready
+          .getOrElse(destination, Vector.empty)
+          .filterNot(_.expiresAt.exists(_ <= now))
         queue.indexWhere(_.visibleAt <= now) match {
           case -1 => (accumulated, taken.reverse)
           case index =>
@@ -262,13 +273,19 @@ private final class MemBroker[F[_], A](
     sample: Double,
   ): State[A] =
     if (envelope.attempt >= settings.maxAttempts)
-      settings.deadLetter.fold(current)(parked => push(current, parked, Pending(envelope, now)))
+      settings.deadLetter.fold(current)(parked =>
+        push(current, parked, Pending(envelope, now, None))
+      )
     else {
-      val next = envelope.copy(attempt = envelope.attempt + 1)
+      val next = envelope.copy(attempt = envelope.attempt + 1, redelivered = true)
       push(
         current,
         destination,
-        Pending(next, now + settings.backoff.delay(envelope.attempt, sample)),
+        Pending(
+          next,
+          now + settings.backoff.delay(envelope.attempt, sample),
+          envelope.message.properties.expiry.map(after => now + after),
+        ),
       )
     }
 

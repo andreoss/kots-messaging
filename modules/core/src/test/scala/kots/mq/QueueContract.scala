@@ -68,7 +68,59 @@ abstract class QueueContract extends CatsEffectSuite {
       for {
         _ <- producer.send(message)
         received <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
-      } yield assertEquals(received.map(_.envelope.message), Some(message))
+        _ <- received.traverse_(_.ack)
+      } yield {
+        assertEquals(received.map(_.envelope.message.payload), Some("body"))
+        assertEquals(received.map(_.envelope.message.headers), Some(Map("trace" -> "1")))
+        assertEquals(received.map(_.envelope.message.key), Some(Some(MessageKey("k"))))
+      }
+    }
+  }
+
+  test("a message keeps the properties brokers carry themselves") {
+    val replyTo = Destination("replies")
+    val properties = MessageProperties.default
+      .withContentType("application/json")
+      .withCorrelationId("correlation-1")
+      .withReplyTo(replyTo)
+      .withPriority(7)
+    withEndpoints { (producer, consumer) =>
+      for {
+        _ <- producer.send(Message.of("body").withProperties(properties))
+        received <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
+        _ <- received.traverse_(_.ack)
+      } yield {
+        val carried = received.map(_.envelope.message.properties)
+        assertEquals(carried.flatMap(_.contentType), Some("application/json"))
+        assertEquals(carried.flatMap(_.correlationId), Some("correlation-1"))
+        assertEquals(carried.flatMap(_.replyTo), Some(replyTo))
+        assertEquals(carried.flatMap(_.priority), Some(7))
+      }
+    }
+  }
+
+  test("a message past its expiry is never delivered where expiry is declared") {
+    whenDeclared(Capability.Expiry) { b =>
+      val destination = fresh
+      for {
+        _ <- b.producer(destination).use(
+          _.send(
+            Message.of("fleeting").withProperties(MessageProperties.default.withExpiry(1.second))
+          )
+        )
+        _ <- IO.sleep(3.seconds)
+        _ <- b.consumer(destination, settings).use { consumer =>
+          for {
+            expired <- CapabilityChecks.receiveWithin(consumer, 2.seconds)
+            _ <- expired.traverse_(_.ack)
+            _ <- IO(assertEquals(expired.map(_.envelope.message.payload), None))
+          } yield ()
+        }
+        _ <- b.producer(destination).use(_.send(Message.of("lasting")))
+        kept <- b.consumer(destination, settings).use(consumer =>
+          CapabilityChecks.receiveWithin(consumer, 10.seconds).flatTap(_.traverse_(_.ack))
+        )
+      } yield assertEquals(kept.map(_.envelope.message.payload), Some("lasting"))
     }
   }
 
@@ -264,6 +316,24 @@ abstract class QueueContract extends CatsEffectSuite {
             _ <- consumer.ackAll(held)
           } yield assertEquals(stolen.map(_.envelope.message.payload), None)
         }
+    }
+  }
+
+  test("a delivery that came back says so") {
+    withEndpoints { (producer, consumer) =>
+      for {
+        _ <- producer.send(Message.of("body"))
+        first <- CapabilityChecks.receiveWithin(consumer, 10.seconds)
+        _ <- first.traverse_(_.reject)
+        again <- CapabilityChecks.receiveWithin(consumer, 30.seconds)
+        _ <- again.traverse_(_.ack)
+      } yield {
+        assertEquals(first.map(_.envelope.redelivered), Some(false))
+        assert(
+          again.exists(delivery => delivery.envelope.redelivered || delivery.envelope.attempt > 1),
+          s"a redelivery reported neither the broker's flag nor an attempt: $again",
+        )
+      }
     }
   }
 

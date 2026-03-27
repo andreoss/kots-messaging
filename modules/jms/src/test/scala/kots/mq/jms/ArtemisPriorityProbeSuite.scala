@@ -17,7 +17,9 @@ final class ArtemisPriorityProbeSuite extends CatsEffectSuite {
         .broker(JmsTestSupport.artemisFactory, JmsTestSupport.artemisSettings)
         .use(
           _.producer(destination).use(
-            _.send(Message("body", Map(JmsBroker.priorityHeader -> "9"), None))
+            _.send(
+              Message.of("body").withProperties(MessageProperties.default.withPriority(9))
+            )
           )
         )
       priority <- IO.blocking {

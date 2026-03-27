@@ -27,6 +27,13 @@ import scala.jdk.CollectionConverters._
 object KafkaBroker {
 
   private[kafka] val attemptHeader = "x-mq-attempt"
+  private[kafka] val contentTypeHeader = "x-mq-content-type"
+  private[kafka] val correlationHeader = "x-mq-correlation-id"
+  private[kafka] val replyToHeader = "x-mq-reply-to"
+  private[kafka] val priorityHeader = "x-mq-priority"
+
+  private[kafka] val reserved: Set[String] =
+    Set(attemptHeader, contentTypeHeader, correlationHeader, replyToHeader, priorityHeader)
 
   def bytes[F[_]](settings: KafkaSettings, entropy: Entropy[F])(implicit
     F: Async[F]
@@ -351,14 +358,24 @@ private final class KafkaBroker[F[_]](
       .map(header => header.key -> new String(header.value, UTF_8))
       .toMap
     val attempt = headers.get(attemptHeader).flatMap(_.toIntOption).getOrElse(1)
+    val carried = MessageProperties(
+      contentType = headers.get(contentTypeHeader),
+      correlationId = headers.get(correlationHeader),
+      replyTo = headers.get(replyToHeader).map(Destination.apply),
+      priority = headers.get(priorityHeader).flatMap(_.toIntOption),
+      persistent = true,
+      expiry = None,
+    )
     Envelope(
       MessageId(s"${record.topic}-${record.partition}-${record.offset}"),
       Message(
         record.value,
-        headers - attemptHeader,
+        headers -- reserved,
         Option(record.key).map(key => MessageKey(new String(key, UTF_8))),
+        carried,
       ),
       attempt,
+      attempt > 1,
     )
   }
 
@@ -376,6 +393,19 @@ private final class KafkaBroker[F[_]](
       record.headers.add(new RecordHeader(name, value.getBytes(UTF_8)))
     }
     record.headers.add(new RecordHeader(attemptHeader, attempt.toString.getBytes(UTF_8)))
+    val carried = message.properties
+    carried.contentType.foreach(value =>
+      record.headers.add(new RecordHeader(contentTypeHeader, value.getBytes(UTF_8)))
+    )
+    carried.correlationId.foreach(value =>
+      record.headers.add(new RecordHeader(correlationHeader, value.getBytes(UTF_8)))
+    )
+    carried.replyTo.foreach(destination =>
+      record.headers.add(new RecordHeader(replyToHeader, destination.name.getBytes(UTF_8)))
+    )
+    carried.priority.foreach(value =>
+      record.headers.add(new RecordHeader(priorityHeader, value.toString.getBytes(UTF_8)))
+    )
     F.async_[RecordMetadata] { callback =>
       client.send(
         record,

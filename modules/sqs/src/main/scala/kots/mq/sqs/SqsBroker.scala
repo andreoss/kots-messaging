@@ -38,6 +38,13 @@ import scala.jdk.CollectionConverters._
 object SqsBroker {
 
   private[sqs] val keyAttribute = "x-mq-key"
+  private[sqs] val contentTypeAttribute = "x-mq-content-type"
+  private[sqs] val correlationAttribute = "x-mq-correlation-id"
+  private[sqs] val replyToAttribute = "x-mq-reply-to"
+  private[sqs] val priorityAttribute = "x-mq-priority"
+
+  private[sqs] val reserved: Set[String] =
+    Set(keyAttribute, contentTypeAttribute, correlationAttribute, replyToAttribute, priorityAttribute)
 
   private[sqs] val recoverableCodes: Set[String] =
     Set("ServiceUnavailable", "ThrottlingException", "RequestThrottled", "InternalError")
@@ -333,9 +340,17 @@ private final class SqsBroker[F[_]](
     val attributes = message.messageAttributes.asScala
     val headers = attributes.view
       .collect {
-        case (name, value) if name != keyAttribute => name -> value.stringValue
+        case (name, value) if !reserved.contains(name) => name -> value.stringValue
       }
       .toMap
+    val carried = MessageProperties(
+      contentType = attributes.get(contentTypeAttribute).map(_.stringValue),
+      correlationId = attributes.get(correlationAttribute).map(_.stringValue),
+      replyTo = attributes.get(replyToAttribute).map(value => Destination(value.stringValue)),
+      priority = attributes.get(priorityAttribute).flatMap(_.stringValue.toIntOption),
+      persistent = true,
+      expiry = None,
+    )
     val attempt = Option(
       message.attributes.get(MessageSystemAttributeName.APPROXIMATE_RECEIVE_COUNT)
     ).flatMap(_.toIntOption).getOrElse(1)
@@ -345,21 +360,28 @@ private final class SqsBroker[F[_]](
         message.body.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1),
         headers,
         attributes.get(keyAttribute).map(value => MessageKey(value.stringValue)),
+        carried,
       ),
       attempt,
+      attempt > 1,
     )
   }
 
-  private def attributesOf(message: Message[Array[Byte]]): Map[String, MessageAttributeValue] =
-    (message.headers.map { case (name, value) =>
-      name -> MessageAttributeValue.builder().dataType("String").stringValue(value).build()
-    } ++ message.key.map(key =>
-      keyAttribute -> MessageAttributeValue
-        .builder()
-        .dataType("String")
-        .stringValue(key.value)
-        .build()
-    )).toMap
+  private def attributesOf(message: Message[Array[Byte]]): Map[String, MessageAttributeValue] = {
+    def attribute(value: String): MessageAttributeValue =
+      MessageAttributeValue.builder().dataType("String").stringValue(value).build()
+
+    val carried = message.properties
+    val described = List(
+      carried.contentType.map(contentTypeAttribute -> _),
+      carried.correlationId.map(correlationAttribute -> _),
+      carried.replyTo.map(destination => replyToAttribute -> destination.name),
+      carried.priority.map(value => priorityAttribute -> value.toString),
+      message.key.map(key => keyAttribute -> key.value),
+    ).flatten.toMap
+
+    (message.headers ++ described).map { case (name, value) => name -> attribute(value) }
+  }
 
   private def bodyOf(message: Message[Array[Byte]]): String =
     new String(message.payload, java.nio.charset.StandardCharsets.ISO_8859_1)

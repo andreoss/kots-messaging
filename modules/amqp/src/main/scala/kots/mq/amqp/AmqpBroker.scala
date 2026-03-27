@@ -90,6 +90,7 @@ private final class AmqpBroker[F[_]](
       Capability.Delay,
       Capability.DeadLetter,
       Capability.Topology,
+      Capability.Expiry,
     )
 
   val events: BrokerEvents[F] = new BrokerEvents[F] {
@@ -360,14 +361,24 @@ private final class AmqpBroker[F[_]](
       )
     val attempt = headers.get(attemptHeader).flatMap(_.toIntOption).getOrElse(1)
     val id = Option(pushed.properties.getMessageId).getOrElse(pushed.tag.toString)
+    val carried = MessageProperties(
+      contentType = Option(pushed.properties.getContentType),
+      correlationId = Option(pushed.properties.getCorrelationId),
+      replyTo = Option(pushed.properties.getReplyTo).map(Destination.apply),
+      priority = Option(pushed.properties.getPriority).map(_.intValue),
+      persistent = Option(pushed.properties.getDeliveryMode).forall(_.intValue == 2),
+      expiry = Option(pushed.properties.getExpiration).flatMap(_.toLongOption).map(_.millis),
+    )
     Envelope(
       MessageId(id),
       Message(
         pushed.body,
         headers - attemptHeader - keyHeader,
         headers.get(keyHeader).map(MessageKey.apply),
+        carried,
       ),
       attempt,
+      pushed.redelivered,
     )
   }
 
@@ -397,8 +408,18 @@ private final class AmqpBroker[F[_]](
         message.headers.map { case (name, value) => name -> (value: AnyRef) } ++
           message.key.map(key => keyHeader -> (key.value: AnyRef)).toMap +
           (attemptHeader -> (attempt.toString: AnyRef))
-      val builder = new AMQP.BasicProperties.Builder().messageId(id).headers(headers.asJava)
-      val properties = expiration.fold(builder)(builder.expiration).build()
+      val carried = message.properties
+      val builder = new AMQP.BasicProperties.Builder()
+        .messageId(id)
+        .headers(headers.asJava)
+        .deliveryMode(if (carried.persistent) 2 else 1)
+      val described = carried.contentType.fold(builder)(builder.contentType)
+      val correlated = carried.correlationId.fold(described)(described.correlationId)
+      val replied = carried.replyTo.fold(correlated)(destination => correlated.replyTo(destination.name))
+      val prioritised =
+        carried.priority.fold(replied)(value => replied.priority(Integer.valueOf(value)))
+      val lifetime = expiration.orElse(carried.expiry.map(_.toMillis.max(0L).toString))
+      val properties = lifetime.fold(prioritised)(prioritised.expiration).build()
 
       val send: F[Deferred[F, Either[String, Unit]]] =
         F.deferred[Either[String, Unit]].flatTap { confirmation =>
