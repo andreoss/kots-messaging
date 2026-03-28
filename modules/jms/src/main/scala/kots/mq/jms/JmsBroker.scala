@@ -119,7 +119,7 @@ private final class JmsBroker[F[_]](
       retryGuard <- Resource.eval(Mutex[F])
       inflight <- Resource.eval(F.ref(Set.empty[String]))
       arrivals <- Resource.eval(Queue.bounded[F, JmsMessage](consumerSettings.prefetch max 1))
-      dispatcher <- Dispatcher.parallel[F](await = false)
+      dispatcher <- Dispatcher.sequential[F](await = false)
       open <- Resource.make(F.ref(true))(_.set(false))
       _ <- Resource.eval(
         F.blocking(

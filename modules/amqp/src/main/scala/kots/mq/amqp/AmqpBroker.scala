@@ -252,7 +252,7 @@ private final class AmqpBroker[F[_]](
       )
       inflight <- Resource.eval(F.ref(Set.empty[Long]))
       arrivals <- Resource.eval(Queue.bounded[F, Pushed](consumerSettings.prefetch max 1))
-      dispatcher <- Dispatcher.parallel[F](await = false)
+      dispatcher <- Dispatcher.sequential[F](await = false)
       _ <- Resource.make(
         F.blocking(
           channel.basicConsume(
