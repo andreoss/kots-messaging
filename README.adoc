@@ -31,21 +31,26 @@ for {
 
 `ConsumerSettings` carries the lease, the attempt budget, the prefetch bound,
 the `Backoff` policy and an optional dead-letter destination.
-`Semantics.atMostOnce` and `Semantics.atLeastOnce` write the delivery mode at
-the call site. `Metered` wraps a producer or consumer with the metrics port,
-`Transcode` carries the algebra from wire bytes to a typed payload through a
-`Codec`, and `Broker.admin` reports a destination's depth where the broker
-publishes one.
+
+A handler says what should happen to its message — `Settlement.Done`,
+`Retry`, `Release`, `Drop` or `DeadLetter` — and `Semantics.process` settles
+it, renewing the lease while the handler runs and bounding how long it may
+take. `Semantics.atMostOnce` and `atLeastOnce` remain for the two plain
+modes. `BatchingProducer` gathers what callers publish one at a time into
+batches; `RateLimit.tokenBucket` paces a consumer; `Metered` binds the
+metrics port; `Transcode` carries the algebra from wire bytes to a typed
+payload; `Broker.admin` states a destination's depth and topology, and
+`Broker.events` reports what the broker says about itself.
 
 ## Brokers
 
 | Broker | Module | Acknowledgement | Capabilities | Tier |
 | --- | --- | --- | --- | --- |
-| In-memory | `mem` | in-process lease | batch, delay, dead-letter, lease extension | unit |
-| Apache Kafka | `kafka` | offset commit | batch, dead-letter, ordering group | e2e |
-| RabbitMQ | `amqp` | channel ack | batch, delay, dead-letter | e2e |
-| Amazon SQS | `sqs` | delete message | batch, delay, dead-letter, lease extension | e2e |
-| ActiveMQ, Artemis | `jms` | per-message ack | batch, dead-letter, and delay and priority where the provider has them | e2e |
+| In-memory | `mem` | in-process lease | batch, delay, dead-letter, lease extension, topology, expiry | unit |
+| Apache Kafka | `kafka` | offset commit | batch, dead-letter, ordering group, topology | e2e |
+| RabbitMQ | `amqp` | channel ack | batch, delay, dead-letter, topology, expiry | e2e |
+| Amazon SQS | `sqs` | delete message | batch, delay, dead-letter, lease extension, topology | e2e |
+| ActiveMQ, Artemis | `jms` | per-message ack | batch, dead-letter, expiry, and delay and priority where the provider has them | e2e |
 
 `stream` adds an fs2 layer, `interop` carries the algebra into the other
 effect system, `prometheus` binds the metrics and depth ports, `bench` times
