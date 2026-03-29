@@ -1,4 +1,4 @@
-# kots-mq
+# kots-messaging
 
 Provider-agnostic message-queue library on Cats and Cats Effect, cross-built
 for Scala 2.13 and 3. One algebra in `core`; every broker is an adapter over
@@ -13,8 +13,8 @@ nothing is acknowledged because an effect happened to complete.
 ```scala
 import cats.effect.IO
 import cats.syntax.all._
-import kots.mq._
-import kots.mq.mem.MemBroker
+import kots.messaging._
+import kots.messaging.mem.MemBroker
 
 val destination = Destination("orders")
 
