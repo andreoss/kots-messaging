@@ -46,6 +46,12 @@ services:
     environment:
       ACTIVEMQ_CONNECTION_USER: admin
       ACTIVEMQ_CONNECTION_PASSWORD: admin
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/61616'"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
   artemis:
     image: docker.io/apache/activemq-artemis:2.42.0
     ports:
@@ -54,6 +60,20 @@ services:
       ARTEMIS_USER: artemis
       ARTEMIS_PASSWORD: artemis
       ANONYMOUS_LOGIN: "false"
+    healthcheck:
+      test:
+        - CMD
+        - /var/lib/artemis-instance/bin/artemis
+        - check
+        - node
+        - --user
+        - artemis
+        - --password
+        - artemis
+      interval: 5s
+      timeout: 20s
+      retries: 40
+      start_period: 45s
   prometheus:
     image: docker.io/prom/prometheus:v3.5.0
     network_mode: host
@@ -62,3 +82,8 @@ services:
       - "--web.listen-address=127.0.0.1:9091"
     volumes:
       - ./scripts/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:9091/-/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
