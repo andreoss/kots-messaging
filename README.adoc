@@ -1,16 +1,17 @@
-# kots-messaging
+= kots-messaging
 
 Provider-agnostic message-queue library on Cats and Cats Effect, cross-built
 for Scala 2.13 and 3. One algebra in `core`; every broker is an adapter over
 it. The core depends on Cats and Cats Effect only.
 
-## Algebra
+== Algebra
 
 `Producer[F, A]` publishes; `Consumer[F, A]` hands out `Delivery[F, A]`
 values carrying `ack`, `reject` and `extend`. Settling is the caller's:
 nothing is acknowledged because an effect happened to complete.
 
-```scala
+[source,scala]
+----
 import cats.effect.IO
 import cats.syntax.all._
 import kots.messaging._
@@ -27,7 +28,7 @@ for {
              consumer.receive.flatMap(_.traverse_(_.ack))
          }
 } yield ()
-```
+----
 
 `ConsumerSettings` carries the lease, the attempt budget, the prefetch bound,
 the `Backoff` policy and an optional dead-letter destination.
@@ -42,15 +43,43 @@ metrics port; `Transcode` carries the algebra from wire bytes to a typed
 payload; `Broker.admin` states a destination's depth and topology, and
 `Broker.events` reports what the broker says about itself.
 
-## Brokers
+== Brokers
 
-| Broker | Module | Acknowledgement | Capabilities | Tier |
-| --- | --- | --- | --- | --- |
-| In-memory | `mem` | in-process lease | batch, delay, dead-letter, lease extension, topology, expiry | unit |
-| Apache Kafka | `kafka` | offset commit | batch, dead-letter, ordering group, topology | e2e |
-| RabbitMQ | `amqp` | channel ack | batch, delay, dead-letter, topology, expiry | e2e |
-| Amazon SQS | `sqs` | delete message | batch, delay, dead-letter, lease extension, topology | e2e |
-| ActiveMQ, Artemis | `jms` | per-message ack | batch, dead-letter, expiry, and delay and priority where the provider has them | e2e |
+[cols="1,1,1,3,1",options="header"]
+|===
+| Broker | Module | Acknowledgement | Capabilities | Tier
+
+| In-memory
+| `mem`
+| in-process lease
+| batch, delay, dead-letter, lease extension, topology, expiry
+| unit
+
+| Apache Kafka
+| `kafka`
+| offset commit
+| batch, dead-letter, ordering group, topology
+| e2e
+
+| RabbitMQ
+| `amqp`
+| channel ack
+| batch, delay, dead-letter, topology, expiry
+| e2e
+
+| Amazon SQS
+| `sqs`
+| delete message
+| batch, delay, dead-letter, lease extension, topology
+| e2e
+
+| ActiveMQ, Artemis
+| `jms`
+| per-message ack
+| batch, dead-letter, expiry, and delay and priority where the provider has
+  them
+| e2e
+|===
 
 `stream` adds an fs2 layer, `interop` carries the algebra into the other
 effect system, `prometheus` binds the metrics and depth ports, `bench` times
@@ -58,20 +87,26 @@ the in-memory adapter against a bare queue. Every adapter passes the same
 contract suite, and an optional feature is tested only where the adapter
 declares it.
 
-## Build and test
+== Build and test
 
-    sbt -batch +test
+[source,shell]
+----
+sbt -batch +test
+----
 
 The unit tier needs no services.
 
-## E2e tier
+== E2e tier
 
 The adapters over live brokers run against the compose stack:
 
-    docker compose up -d --wait
-    ./scripts/artemis-init.sh
-    sbt -batch kafka/test amqp/test sqs/test jms/test prometheus/test
-    docker compose down
+[source,shell]
+----
+docker compose up -d --wait
+./scripts/artemis-init.sh
+sbt -batch kafka/test amqp/test sqs/test jms/test prometheus/test
+docker compose down
+----
 
 The metrics suite serves a live workload on `127.0.0.1:19096` and asserts the
 composed Prometheus scrapes its series back.
