@@ -94,11 +94,15 @@ declares it.
 sbt -batch +test
 ----
 
-The unit tier needs no services.
+That is the whole unit tier — the algebra, the in-memory adapter, the
+streaming layer and the interop layer — and it needs no services.
 
-== E2e tier
+== Against live brokers
 
-The adapters over live brokers run against the compose stack:
+Every other adapter needs its own broker, and they all come from the one
+`compose.yaml` at the root. Bring the stack up, raise the Artemis disk guard
+so that broker refuses a publish rather than silently blocking one, run the
+adapter suites, and take it down again:
 
 [source,shell]
 ----
@@ -108,5 +112,10 @@ sbt -batch kafka/test amqp/test sqs/test jms/test prometheus/test
 docker compose down
 ----
 
-The metrics suite serves a live workload on `127.0.0.1:19096` and asserts the
-composed Prometheus scrapes its series back.
+`--wait` returns once every service reports healthy, so nothing races the
+broker's own start-up. Each suite can also be run alone against its own
+service: `docker compose up -d --wait rabbitmq` is enough for `amqp/test`.
+
+The metrics suite is the odd one out. It serves a live workload on
+`127.0.0.1:19096` and asserts that the composed Prometheus scrapes its series
+back, so what it proves is the exposition, not a broker.
