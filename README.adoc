@@ -97,12 +97,12 @@ sbt -batch +test
 That is the whole unit tier — the algebra, the in-memory adapter, the
 streaming layer and the interop layer — and it needs no services.
 
-== Against live brokers
+== Integration tests
 
-Every other adapter needs its own broker, and they all come from the one
-`compose.yaml` at the root. Bring the stack up, raise the Artemis disk guard
-so that broker refuses a publish rather than silently blocking one, run the
-adapter suites, and take it down again:
+Every other adapter is tested against its own broker, and they all come from
+the one `compose.yaml` at the root. Bring the stack up, raise the Artemis
+disk guard so that broker refuses a publish rather than silently blocking
+one, run the adapter suites, and take it down again:
 
 [source,shell]
 ----
