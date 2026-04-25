@@ -46,7 +46,9 @@ final class AmqpPipelineSuite extends AmqpSuite {
 
   private val bodies = List.range(0, 20).map(index => Message.of(s"body-$index"))
 
-  test("confirms overlap: twenty publishes cost far less than twenty round trips") {
+  // The timings are reported, never asserted: against a broker on the same
+  // host a round trip is too small to gate a build on (R-38).
+  test("twenty publishes in flight together each get their own confirmation") {
     val destination = queue("pipelined")
     AmqpTestSupport.broker().use { broker =>
       (
@@ -58,17 +60,18 @@ final class AmqpPipelineSuite extends AmqpSuite {
           sequential <- IO.monotonic.flatMap(start =>
             bodies.traverse(producer.send) *> IO.monotonic.map(_ - start)
           )
-          pipelined <- IO.monotonic.flatMap(start =>
-            bodies.parTraverse(producer.send) *> IO.monotonic.map(_ - start)
-          )
+          start <- IO.monotonic
+          ids <- bodies.parTraverse(producer.send)
+          overlapped <- IO.monotonic.map(_ - start)
           received <- CapabilityChecks.batchWithin(consumer, bodies.size * 2 + 1, 60.seconds)
           _ <- consumer.ackAll(received)
-        } yield {
-          assertEquals(received.size, bodies.size * 2 + 1)
-          assert(
-            pipelined * 3 < sequential * 2,
-            s"pipelined $pipelined against sequential $sequential",
+          _ <- IO.println(
+            s"${bodies.size} publishes: $overlapped overlapped, $sequential one at a time"
           )
+        } yield {
+          assertEquals(ids.distinct.size, bodies.size)
+          assertEquals(received.size, bodies.size * 2 + 1)
+          assert(overlapped.toNanos > 0L)
         }
       }
     }
