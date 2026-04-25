@@ -59,26 +59,26 @@ payload; `Broker.admin` states a destination's depth and topology, and
 | `kafka`
 | offset commit
 | batch, dead-letter, ordering group, topology
-| e2e
+| integration
 
 | RabbitMQ
 | `amqp`
 | channel ack
 | batch, delay, dead-letter, topology, expiry
-| e2e
+| integration
 
 | Amazon SQS
 | `sqs`
 | delete message
 | batch, delay, dead-letter, lease extension, topology
-| e2e
+| integration
 
 | ActiveMQ, Artemis
 | `jms`
 | per-message ack
 | batch, dead-letter, expiry, and delay and priority where the provider has
   them
-| e2e
+| integration
 |===
 
 `stream` adds an fs2 layer, `interop` carries the algebra into the other
